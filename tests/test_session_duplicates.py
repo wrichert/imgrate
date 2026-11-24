@@ -58,9 +58,14 @@ def test_duplicates_mode_shows_groups_in_time_order(burst_session: RatingSession
         "burst/forest_1.jpg",
         "burst/forest_2.jpg",
     ]
-    group_position = burst_session.current_group_position
-    assert group_position is not None
-    assert (group_position.group_number, group_position.group_count, group_position.member_count) == (1, 2, 3)
+    section_position = burst_session.current_section_position
+    assert section_position is not None
+    assert (section_position.section_number, section_position.section_count, section_position.section.size) == (
+        1,
+        2,
+        3,
+    )
+    assert section_position.section.label == "group 1 · 2024-06-01 06:00"
 
 
 def test_keep_best_rejects_rest_of_group_and_undo_restores_all(burst_session: RatingSession) -> None:
@@ -90,15 +95,39 @@ def test_duplicates_mode_hides_groups_without_matching_member(burst_session: Rat
     assert visible_paths(burst_session) == ["burst/forest_1.jpg", "burst/forest_2.jpg"]
 
 
-def test_move_by_group(burst_session: RatingSession) -> None:
+def test_move_by_section_between_groups(burst_session: RatingSession) -> None:
     burst_session.set_duplicates_mode(is_duplicates_mode=True)
 
-    burst_session.move_by_group(1)
+    burst_session.move_by_section(1)
     assert burst_session.current_index == 3
-    burst_session.move_by_group(5)
+    burst_session.move_by_section(5)
     assert burst_session.current_index == 3
-    burst_session.move_by_group(-1)
+    burst_session.move_by(1)
+    burst_session.move_by_section(-1)  # from inside a section: back to its start
+    assert burst_session.current_index == 3
+    burst_session.move_by_section(-1)
     assert burst_session.current_index == 0
+
+
+def test_rating_sort_has_one_section_per_rating(burst_session: RatingSession) -> None:
+    for media_file, rating in zip(burst_session.visible_files[:3], (5, 5, REJECTED), strict=True):
+        burst_session.rate(media_file, rating=rating)
+
+    burst_session.set_sort_order(SortOrder.RATING)
+
+    assert [(section.label, section.size) for section in burst_session.sections] == [
+        ("★★★★★", 2),
+        ("unrated", 4),
+        ("rejected", 1),
+    ]
+
+
+def test_date_sort_has_month_sections_and_path_sort_has_folder_sections(burst_session: RatingSession) -> None:
+    assert [(section.label, section.size) for section in burst_session.sections] == [("burst", 6), ("later", 1)]
+
+    burst_session.set_sort_order(SortOrder.DATE)
+
+    assert [(section.label, section.size) for section in burst_session.sections] == [("June 2024", 7)]
 
 
 def test_sort_by_rating_puts_best_first_and_rejected_last(burst_session: RatingSession) -> None:

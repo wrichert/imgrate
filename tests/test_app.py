@@ -80,12 +80,13 @@ async def test_background_indexing_then_duplicates_mode_and_keep_best(
         await pilot.press("d")
         await pilot.press("g")
         await pilot.pause(0.3)
-        assert len([cell for cell in app.query(ThumbnailCell) if cell.relative_path]) == 3
+        assert len([cell for cell in app.query(ThumbnailCell) if cell.relative_path]) == 5
+        assert len(app.query(".section-header")) == 2
         await pilot.press("b")
         await pilot.pause()
-        group_position = session.current_group_position
-        assert group_position is not None
-        assert group_position.group_number == 2
+        section_position = session.current_section_position
+        assert section_position is not None
+        assert section_position.section_number == 2
 
     ratings = store.load_ratings()
     assert ratings == {"burst/sunrise_2.jpg": REJECTED, "burst/sunrise_3.jpg": REJECTED}

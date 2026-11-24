@@ -22,6 +22,14 @@ from textual_image.widget import Image as ImageWidget
 from textual_image.widget import get_cell_size
 
 from imgrate.fingerprints import Fingerprint, compute_image_signature
+from imgrate.grid_layout import (
+    GridPage,
+    GridRow,
+    build_grid_rows,
+    find_index_in_adjacent_row,
+    find_page_index,
+    paginate_grid_rows,
+)
 from imgrate.media import scan_media_files
 from imgrate.preview import PreviewCache
 from imgrate.ratings import ALL_BUCKETS, FILTER_PRESETS, MAX_STARS, REJECTED, describe_bucket, format_stars
@@ -35,6 +43,7 @@ if TYPE_CHECKING:
 
     from textual.binding import BindingType
     from textual.timer import Timer
+    from textual.widget import Widget
 
     from imgrate.media import MediaFile, ScanResult
     from imgrate.preview import Preview
@@ -99,11 +108,12 @@ class IndexingProgress:
 
 
 @dataclass(frozen=True, slots=True)
-class GridPage:
-    """Visible-list index range ``[start_index, end_index)`` shown in the grid."""
+class GridLayoutKey:
+    """Everything the grid's rows and pages depend on; a change triggers a re-layout."""
 
-    start_index: int
-    end_index: int
+    view_version: int
+    column_count: int
+    available_height: int
 
 
 def build_rating_text(rating: int | None) -> Text:
@@ -116,11 +126,11 @@ def build_rating_text(rating: int | None) -> Text:
 
 
 class ThumbnailCell(Vertical):
-    """One tile of the grid: thumbnail plus rating line."""
+    """One tile of the grid: thumbnail plus rating line. ``file_index`` is ``None`` for padding tiles."""
 
-    def __init__(self, *, slot_index: int) -> None:
-        super().__init__(classes="thumbnail")
-        self.slot_index = slot_index
+    def __init__(self, *, file_index: int | None) -> None:
+        super().__init__(classes="thumbnail" if file_index is not None else "thumbnail empty")
+        self.file_index = file_index
         self.relative_path: str | None = None
 
     def compose(self) -> ComposeResult:
@@ -139,6 +149,8 @@ class ImageRaterApp(App[None]):
     THUMBNAIL_EDGE_PX = 384
     THUMBNAIL_WIDTH_CELLS = 28
     THUMBNAIL_HEIGHT_CELLS = 13
+    """Must match ``.thumbnail-row { height }`` in CSS."""
+    SECTION_HEADER_HEIGHT_CELLS = 1
     PAGE_JUMP_SIZE = 10
     PREFETCH_AHEAD_COUNT = 3
     RESIZE_DEBOUNCE_SECONDS = 0.15
@@ -152,8 +164,11 @@ class ImageRaterApp(App[None]):
     #viewer { width: 1fr; height: 1fr; align: center middle; }
     #preview { width: auto; height: auto; }
     #placeholder { width: 100%; height: 100%; content-align: center middle; color: $text-muted; }
-    #grid { width: 1fr; height: 1fr; layout: grid; display: none; }
-    .thumbnail { border: round $panel; height: 100%; }
+    #grid { width: 1fr; height: 1fr; display: none; }
+    .section-header { height: 1; padding: 0 1; background: $boost; color: $accent; text-style: bold; }
+    .thumbnail-row { height: 13; }
+    .thumbnail { border: round $panel; height: 100%; width: 1fr; }
+    .thumbnail.empty { border: none; }
     .thumbnail.current { border: heavy $accent; }
     .thumbnail-image-box { height: 1fr; align: center middle; }
     .thumbnail-image { width: auto; height: auto; }
@@ -176,6 +191,8 @@ class ImageRaterApp(App[None]):
         Binding("up,k", "move_row(-1)", "Up", show=False),
         Binding("pagedown", "move_page(1)", "Page down", show=False),
         Binding("pageup", "move_page(-1)", "Page up", show=False),
+        Binding("right_square_bracket,full_stop", "move_section(1)", "Next section", key_display="] ."),
+        Binding("left_square_bracket,comma", "move_section(-1)", "Prev section", show=False),
         Binding("home", "move_to_start", "First", show=False),
         Binding("end", "move_to_end", "Last", show=False),
         *(
@@ -216,8 +233,10 @@ class ImageRaterApp(App[None]):
         self._preview_cache = PreviewCache()
         self._is_auto_advance = True
         self._is_grid_mode = False
-        self._grid_columns = 0
-        self._grid_rows = 0
+        self._grid_layout_key: GridLayoutKey | None = None
+        self._grid_rows: list[GridRow] = []
+        self._grid_pages: list[GridPage] = []
+        self._shown_grid_page: GridPage | None = None
         self._resize_timer: Timer | None = None
         self._current_preview: Preview | None = None
 
@@ -252,15 +271,25 @@ class ImageRaterApp(App[None]):
         self._navigate(lambda: self._session.move_by(delta))
 
     def action_move_row(self, direction: int) -> None:
-        step = self._grid_columns if self._is_grid_mode and self._grid_columns else 1
-        self._navigate(lambda: self._session.move_by(direction * step))
+        if not (self._is_grid_mode and self._grid_rows):
+            self._navigate(lambda: self._session.move_by(direction))
+            return
+        target_index = find_index_in_adjacent_row(
+            self._grid_rows, file_index=self._session.current_index, direction=direction
+        )
+        self._navigate(lambda: self._session.move_to(target_index))
 
     def action_move_page(self, direction: int) -> None:
-        if self._session.is_duplicates_mode:
-            self._navigate(lambda: self._session.move_by_group(direction))
+        if not (self._is_grid_mode and self._grid_pages):
+            self._navigate(lambda: self._session.move_by(direction * self.PAGE_JUMP_SIZE))
             return
-        step = self._grid_page_size if self._is_grid_mode else self.PAGE_JUMP_SIZE
-        self._navigate(lambda: self._session.move_by(direction * step))
+        page_index = find_page_index(self._grid_pages, self._session.current_index)
+        target_page_index = max(0, min(page_index + direction, len(self._grid_pages) - 1))
+        target_index = self._grid_pages[target_page_index].start_index
+        self._navigate(lambda: self._session.move_to(target_index))
+
+    def action_move_section(self, direction: int) -> None:
+        self._navigate(lambda: self._session.move_by_section(direction))
 
     def action_move_to_start(self) -> None:
         self._navigate(lambda: self._session.move_to(0))
@@ -318,7 +347,7 @@ class ImageRaterApp(App[None]):
         if not changes:
             return
         self.notify(f"Kept 1, rejected {len(changes)} — z to undo", timeout=2)
-        self._session.move_by_group(1)
+        self._session.move_by_section(1)
         self._refresh_all()
 
     def action_cycle_filter(self, direction: int) -> None:
@@ -483,10 +512,6 @@ class ImageRaterApp(App[None]):
 
     # ----------------------------------------------------------------- helpers
 
-    @property
-    def _grid_page_size(self) -> int:
-        return max(1, self._grid_columns * self._grid_rows)
-
     def _move_to_next_unrated(self) -> None:
         if not self._session.move_to_next_unrated():
             self.notify("No unrated files in this view")
@@ -524,17 +549,19 @@ class ImageRaterApp(App[None]):
         if current_file is None:
             self.query_one("#statusbar", Static).update(Text("no files in this view", style="dim"))
             return
-        group_position = self._session.current_group_position
-        position_text = (
-            f"group {group_position.group_number:,}/{group_position.group_count:,}"
-            f" · {group_position.member_number}/{group_position.member_count}"
-            if group_position is not None
-            else f"{self._session.current_index + 1:,} / {self._session.visible_count:,}"
+        section_position = self._session.current_section_position
+        section_text = (
+            ""
+            if section_position is None
+            else f"§ {section_position.section.label}  {section_position.member_number}/"
+            f"{section_position.section.size}  ({section_position.section_number}/{section_position.section_count})"
         )
         status_text = Text.assemble(
             build_rating_text(self._session.current_rating),
             "   ",
-            (position_text, "bold"),
+            (f"{self._session.current_index + 1:,} / {self._session.visible_count:,}", "bold"),
+            "   ",
+            (section_text, "magenta"),
             "   ",
             (current_file.relative_path, ""),
             "   ",
@@ -677,57 +704,78 @@ class ImageRaterApp(App[None]):
         if grid_size.width == 0 or grid_size.height == 0:
             self.call_after_refresh(self._refresh_grid)
             return
-        columns = max(1, grid_size.width // self.THUMBNAIL_WIDTH_CELLS)
-        rows = max(1, grid_size.height // self.THUMBNAIL_HEIGHT_CELLS)
-        if (columns, rows) != (self._grid_columns, self._grid_rows):
-            self._grid_columns, self._grid_rows = columns, rows
+        if not self._session.visible_files:
+            self._shown_grid_page = None
             grid.remove_children()
-            grid.styles.grid_size_columns = columns
-            grid.styles.grid_size_rows = rows
-            grid.mount_all(ThumbnailCell(slot_index=slot_index) for slot_index in range(columns * rows))
+            grid.mount(Static(Text("No files in this view", style="dim"), classes="section-header"))
+            return
+        layout_key = GridLayoutKey(
+            view_version=self._session.view_version,
+            column_count=max(1, grid_size.width // self.THUMBNAIL_WIDTH_CELLS),
+            available_height=grid_size.height,
+        )
+        if layout_key != self._grid_layout_key:
+            self._grid_layout_key = layout_key
+            self._grid_rows = build_grid_rows(self._session.sections, column_count=layout_key.column_count)
+            self._grid_pages = paginate_grid_rows(
+                self._grid_rows,
+                available_height=layout_key.available_height,
+                header_height=self.SECTION_HEADER_HEIGHT_CELLS,
+                thumbnail_row_height=self.THUMBNAIL_HEIGHT_CELLS,
+            )
+            self._shown_grid_page = None
+        page = self._grid_pages[find_page_index(self._grid_pages, self._session.current_index)]
+        if page is not self._shown_grid_page:
+            self._shown_grid_page = page
+            grid.remove_children()
+            grid.mount_all(self._build_grid_page_widgets(page, column_count=layout_key.column_count))
             self.call_after_refresh(self._fill_grid)
             return
         self._fill_grid()
 
+    def _build_grid_page_widgets(self, page: GridPage, *, column_count: int) -> list[Widget]:
+        widgets: list[Widget] = []
+        for row in page.rows:
+            if row.is_header:
+                widgets.append(Static(self._build_section_header_text(row), classes="section-header"))
+                continue
+            file_indices = list(range(row.start_index, row.end_index))
+            padding = [None] * (column_count - len(file_indices))
+            widgets.append(
+                Horizontal(
+                    *(ThumbnailCell(file_index=file_index) for file_index in [*file_indices, *padding]),
+                    classes="thumbnail-row",
+                )
+            )
+        return widgets
+
+    def _build_section_header_text(self, row: GridRow) -> Text:
+        section_number = self._session.sections.index(row.section) + 1
+        return Text.assemble(
+            (row.section.label, "bold"),
+            (f"   {row.section.size:,} {'file' if row.section.size == 1 else 'files'}", ""),
+            (f"   section {section_number}/{len(self._session.sections)}", "dim"),
+        )
+
     def _fill_grid(self) -> None:
         grid = self.query_one("#grid", Container)
         visible_files = self._session.visible_files
-        grid_page = self._compute_grid_page()
-        cell_columns = max(1, grid.content_size.width // self._grid_columns - 2)
-        cell_rows = max(1, grid.content_size.height // self._grid_rows - 3)
+        cell_columns = max(1, grid.content_size.width // max(1, self._grid_layout_key.column_count) - 2)
+        cell_rows = self.THUMBNAIL_HEIGHT_CELLS - 3  # border + rating line
         for cell in grid.query(ThumbnailCell):
-            file_index = grid_page.start_index + cell.slot_index
-            media_file = visible_files[file_index] if file_index < grid_page.end_index else None
-            cell.set_class(file_index == self._session.current_index, "current")
-            label = cell.query_one(".thumbnail-label", Label)
-            if media_file is None:
-                cell.relative_path = None
-                cell.query_one(ImageWidget).image = None
-                label.update("")
+            if cell.file_index is None or cell.file_index >= len(visible_files):
                 continue
-            label.update(build_rating_text(self._session.get_rating(media_file)))
+            media_file = visible_files[cell.file_index]
+            cell.set_class(cell.file_index == self._session.current_index, "current")
+            cell.query_one(".thumbnail-label", Label).update(build_rating_text(self._session.get_rating(media_file)))
             if cell.relative_path != media_file.relative_path:
                 cell.relative_path = media_file.relative_path
-                cell.query_one(ImageWidget).image = None
                 self.run_worker(
                     self._load_thumbnail(
                         cell=cell, media_file=media_file, max_columns=cell_columns, max_rows=cell_rows
                     ),
                     group="thumbnails",
                 )
-
-    def _compute_grid_page(self) -> GridPage:
-        """Aligned pages normally; in duplicates mode one group per page (split if it is larger)."""
-        page_size = self._grid_page_size
-        current_index = self._session.current_index
-        group_position = self._session.current_group_position
-        if group_position is None:
-            start_index = (current_index // page_size) * page_size
-            end_index = min(start_index + page_size, self._session.visible_count)
-            return GridPage(start_index=start_index, end_index=end_index)
-        group_end_index = group_position.start_index + group_position.member_count
-        start_index = group_position.start_index + (current_index - group_position.start_index) // page_size * page_size
-        return GridPage(start_index=start_index, end_index=min(start_index + page_size, group_end_index))
 
     async def _load_thumbnail(
         self, *, cell: ThumbnailCell, media_file: MediaFile, max_columns: int, max_rows: int

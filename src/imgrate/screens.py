@@ -146,14 +146,15 @@ HELP_TEXT = """\
 [b]Navigation[/b]
   → l space      next          ← h          previous
   ↓ / ↑          next / previous (grid: row down / up)
-  pgdn / pgup    jump 10 (grid: page; duplicates: group)
+  pgdn / pgup    jump 10 (grid: page)
+  ] . / [ ,      next / previous section (folder · rating · month · duplicate group)
   home / end     first / last
   n              next unrated
 
 [b]Review[/b]
   v / V          cycle rating view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected
   f              choose rating view (any combination)
-  s              cycle sort: path · rating (best first) · date taken
+  s              cycle sort: path · rating (best first) · date taken — also sets the sections
   g              toggle thumbnail grid
   enter          grid → open highlighted image
 
@@ -170,7 +171,8 @@ HELP_TEXT = """\
   q              quit
 
 Ratings are saved immediately to the SQLite file shown in the sidebar.
-Export the keepers:  imgrate export ROOT DEST --min-rating 5
+Export:  imgrate export ROOT DEST --min-rating 4      (4 and 5 stars)
+         imgrate export ROOT DEST --rating 3          (exactly 3; repeatable, 0 = rejected)
 """
 
 

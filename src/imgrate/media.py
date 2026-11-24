@@ -65,6 +65,13 @@ def normalize_extension(extension: str) -> str:
     return stripped_extension if stripped_extension.startswith(".") else f".{stripped_extension}"
 
 
+def build_path_sort_key(relative_path: str) -> tuple[str, str]:
+    """Folder first, then name: keeps each folder contiguous (``a/x.jpg`` before ``a/sub/y.jpg`` … ``a/z.jpg``
+    would otherwise interleave)."""
+    folder, _, file_name = relative_path.lower().rpartition("/")
+    return (folder, file_name)
+
+
 def is_ignored_directory(name: str) -> bool:
     """Hidden folders and NAS/OS metadata folders are skipped."""
     return name.startswith(".") or name in IGNORED_DIRECTORY_NAMES
@@ -84,7 +91,7 @@ def scan_media_files(root: Path) -> ScanResult:
             if media_file is not None:
                 files.append(media_file)
 
-    files.sort(key=lambda media_file: media_file.relative_path.lower())
+    files.sort(key=lambda media_file: build_path_sort_key(media_file.relative_path))
     extension_counts = dict(Counter(media_file.extension for media_file in files).most_common())
     return ScanResult(root=resolved_root, files=files, extension_counts=extension_counts)
 

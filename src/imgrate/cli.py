@@ -36,7 +36,15 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser = subparsers.add_parser("export", help="copy or link rated files to a folder")
     export_parser.add_argument("root", type=Path)
     export_parser.add_argument("destination", type=Path)
-    export_parser.add_argument("--min-rating", type=int, default=MAX_STARS, help="minimum stars (default: 5)")
+    rating_selection = export_parser.add_mutually_exclusive_group()
+    rating_selection.add_argument("--min-rating", type=int, default=None, help="minimum stars (default: 5)")
+    rating_selection.add_argument(
+        "--rating",
+        type=int,
+        action="append",
+        dest="ratings",
+        help="exactly this rating, repeatable (0 = rejected), e.g. --rating 3 --rating 4",
+    )
     export_parser.add_argument("--symlink", action="store_true", help="create symlinks instead of copies")
     export_parser.add_argument("--flat", action="store_true", help="do not recreate the sub folder structure")
     export_parser.add_argument("--dry-run", action="store_true", help="only print what would be exported")
@@ -63,14 +71,18 @@ def main(argv: list[str] | None = None) -> int:
         if parsed.command == "stats":
             print_stats(store)
             return 0
-        if not 1 <= parsed.min_rating <= MAX_STARS:
-            print(f"imgrate: --min-rating must be 1..{MAX_STARS}", file=sys.stderr)
+        selected_ratings = select_export_ratings(min_rating=parsed.min_rating, exact_ratings=parsed.ratings)
+        if not selected_ratings:
+            print(
+                f"imgrate: --rating must be {REJECTED}..{MAX_STARS}, --min-rating must be 1..{MAX_STARS}",
+                file=sys.stderr,
+            )
             return 2
         summary = export_rated_files(
             store=store,
             root=root,
             destination=parsed.destination.expanduser().resolve(),
-            min_rating=parsed.min_rating,
+            ratings=selected_ratings,
             is_symlink=parsed.symlink,
             is_flat=parsed.flat,
             is_dry_run=parsed.dry_run,
@@ -110,12 +122,12 @@ def export_rated_files(
     store: RatingStore,
     root: Path,
     destination: Path,
-    min_rating: int,
+    ratings: frozenset[int],
     is_symlink: bool,
     is_flat: bool,
     is_dry_run: bool,
 ) -> ExportSummary:
-    selected_paths = sorted(path for path, rating in store.load_ratings().items() if rating >= min_rating)
+    selected_paths = sorted(path for path, rating in store.load_ratings().items() if rating in ratings)
     exported_count = 0
     missing_count = 0
     used_flat_names: set[str] = set()
@@ -142,6 +154,18 @@ def export_rated_files(
         else:
             shutil.copy2(source_path, target_path)
     return ExportSummary(exported_count=exported_count, missing_count=missing_count)
+
+
+def select_export_ratings(*, min_rating: int | None, exact_ratings: list[int] | None) -> frozenset[int]:
+    """Ratings to export; empty if the arguments are out of range. Default: 5 stars only."""
+    if exact_ratings:
+        if any(not REJECTED <= rating <= MAX_STARS for rating in exact_ratings):
+            return frozenset()
+        return frozenset(exact_ratings)
+    effective_min_rating = MAX_STARS if min_rating is None else min_rating
+    if not 1 <= effective_min_rating <= MAX_STARS:
+        return frozenset()
+    return frozenset(range(effective_min_rating, MAX_STARS + 1))
 
 
 def build_unique_flat_name(*, relative_path: str, used_names: set[str]) -> str:

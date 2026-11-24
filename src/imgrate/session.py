@@ -5,15 +5,16 @@ from __future__ import annotations
 import bisect
 from collections import Counter
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from imgrate.duplicates import DuplicateFinder, DuplicateGroup, HashedFile
-from imgrate.media import IMAGE_EXTENSIONS, MediaFile, ScanResult
-from imgrate.ratings import ALL_FILTER, MAX_STARS, REJECTED, RatingBucket, RatingFilter
+from imgrate.media import IMAGE_EXTENSIONS, MediaFile, ScanResult, build_path_sort_key
+from imgrate.ratings import ALL_FILTER, MAX_STARS, REJECTED, RatingBucket, RatingFilter, describe_bucket
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Callable, Iterable
     from pathlib import Path
 
     from imgrate.fingerprints import Fingerprint
@@ -34,22 +35,51 @@ class RatingChange:
 
 
 @dataclass(frozen=True, slots=True)
-class GroupPosition:
-    """Where the cursor is in duplicates mode (1-based numbers for display)."""
+class Section:
+    """A contiguous run ``[start_index, end_index)`` of the visible list: a folder, rating, month or duplicate group."""
 
-    group_number: int
-    group_count: int
-    member_number: int
-    member_count: int
+    label: str
     start_index: int
-    """Index of the group's first member in the visible list."""
+    end_index: int
+
+    @property
+    def size(self) -> int:
+        return self.end_index - self.start_index
 
 
 @dataclass(frozen=True, slots=True)
-class DuplicateView:
+class SectionPosition:
+    """Where the cursor is (1-based numbers for display)."""
+
+    section: Section
+    section_number: int
+    section_count: int
+    member_number: int
+
+
+@dataclass(frozen=True, slots=True)
+class SectionedFiles:
     files: list[MediaFile]
-    group_starts: list[int]
-    """Visible-list index of each group's first member."""
+    sections: list[Section]
+
+
+def split_into_sections(files: list[MediaFile], *, build_label: Callable[[MediaFile], str]) -> list[Section]:
+    """One section per run of consecutive files with the same label."""
+    sections: list[Section] = []
+    start_index = 0
+    for index in range(1, len(files) + 1):
+        if index == len(files) or build_label(files[index]) != build_label(files[start_index]):
+            sections.append(Section(label=build_label(files[start_index]), start_index=start_index, end_index=index))
+            start_index = index
+    return sections
+
+
+def format_folder_label(media_file: MediaFile) -> str:
+    return media_file.relative_path.rpartition("/")[0] or "(top folder)"
+
+
+def format_month_label(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, UTC).strftime("%B %Y")
 
 
 def rank_rating_for_sort(rating: int | None) -> int:
@@ -87,7 +117,9 @@ class RatingSession:
         self._rating_filter = ALL_FILTER
         self._sort_order = SortOrder.PATH
         self._visible_files: list[MediaFile] = []
-        self._visible_group_starts: list[int] = []
+        self._sections: list[Section] = []
+        self._section_starts: list[int] = []
+        self._view_version = 0
         self._current_index = 0
         self._undo_stack: list[list[RatingChange]] = []
         self.rebuild_duplicate_groups()
@@ -158,22 +190,25 @@ class RatingSession:
         return None if current_file is None else self._ratings.get(current_file.relative_path)
 
     @property
-    def current_group_position(self) -> GroupPosition | None:
-        if not self._is_duplicates_mode or not self._visible_group_starts:
+    def sections(self) -> list[Section]:
+        return self._sections
+
+    @property
+    def view_version(self) -> int:
+        """Incremented whenever the visible list (and so its sections) is rebuilt."""
+        return self._view_version
+
+    @property
+    def current_section_position(self) -> SectionPosition | None:
+        if not self._sections:
             return None
-        group_offset = bisect.bisect_right(self._visible_group_starts, self._current_index) - 1
-        start_index = self._visible_group_starts[group_offset]
-        end_index = (
-            self._visible_group_starts[group_offset + 1]
-            if group_offset + 1 < len(self._visible_group_starts)
-            else len(self._visible_files)
-        )
-        return GroupPosition(
-            group_number=group_offset + 1,
-            group_count=len(self._visible_group_starts),
-            member_number=self._current_index - start_index + 1,
-            member_count=end_index - start_index,
-            start_index=start_index,
+        section_offset = bisect.bisect_right(self._section_starts, self._current_index) - 1
+        section = self._sections[section_offset]
+        return SectionPosition(
+            section=section,
+            section_number=section_offset + 1,
+            section_count=len(self._sections),
+            member_number=self._current_index - section.start_index + 1,
         )
 
     # ----------------------------------------------------------------- queries
@@ -212,13 +247,16 @@ class RatingSession:
     def move_by(self, delta: int) -> None:
         self.move_to(self._current_index + delta)
 
-    def move_by_group(self, delta: int) -> None:
-        """Duplicates mode: jump to the first member of the next / previous group."""
-        group_position = self.current_group_position
-        if group_position is None:
+    def move_by_section(self, delta: int) -> None:
+        """Jump to the first file of the next / previous section; backwards from inside a section goes to its start."""
+        section_position = self.current_section_position
+        if section_position is None:
             return
-        target_offset = max(0, min(group_position.group_number - 1 + delta, len(self._visible_group_starts) - 1))
-        self._current_index = self._visible_group_starts[target_offset]
+        section_offset = section_position.section_number - 1
+        if delta < 0 and section_position.member_number > 1:
+            delta += 1
+        target_offset = max(0, min(section_offset + delta, len(self._sections) - 1))
+        self._current_index = self._sections[target_offset].start_index
 
     def move_to_next_unrated(self) -> bool:
         """Move to the next unrated file after the cursor (wrapping). Returns whether one was found."""
@@ -245,14 +283,14 @@ class RatingSession:
 
     def reject_others_in_group(self) -> list[RatingChange]:
         """Duplicates mode: keep the current file, reject every other member of its group (one undo step)."""
-        group_position = self.current_group_position
-        if group_position is None:
+        section_position = self.current_section_position
+        if not self._is_duplicates_mode or section_position is None:
             return []
-        group_end_index = group_position.start_index + group_position.member_count
+        section = section_position.section
         changes = [
             self._apply_rating(relative_path=media_file.relative_path, rating=REJECTED)
             for index, media_file in enumerate(
-                self._visible_files[group_position.start_index : group_end_index], start=group_position.start_index
+                self._visible_files[section.start_index : section.end_index], start=section.start_index
             )
             if index != self._current_index
         ]
@@ -365,16 +403,14 @@ class RatingSession:
     def _rebuild_visible_files(self) -> None:
         anchor_file = self.current_file
         previous_index = self._current_index
-        if self._is_duplicates_mode:
-            duplicate_view = self._build_duplicate_view()
-            self._visible_files = duplicate_view.files
-            self._visible_group_starts = duplicate_view.group_starts
-        else:
-            self._visible_files = self._build_sorted_view()
-            self._visible_group_starts = []
+        sectioned_files = self._build_duplicate_view() if self._is_duplicates_mode else self._build_sorted_view()
+        self._visible_files = sectioned_files.files
+        self._sections = sectioned_files.sections
+        self._section_starts = [section.start_index for section in self._sections]
+        self._view_version += 1
         self._restore_cursor(anchor_file=anchor_file, previous_index=previous_index)
 
-    def _build_sorted_view(self) -> list[MediaFile]:
+    def _build_sorted_view(self) -> SectionedFiles:
         matching_files = [
             media_file
             for media_file in self._scan_result.files
@@ -383,15 +419,27 @@ class RatingSession:
         if self._sort_order is SortOrder.RATING:
             # Stable sort: within one rating the path order of the scan is kept.
             matching_files.sort(key=lambda media_file: rank_rating_for_sort(self.get_rating(media_file)))
+            build_label = self._format_rating_label
         elif self._sort_order is SortOrder.DATE:
             matching_files.sort(key=self._compute_sort_timestamp)
-        return matching_files
+            build_label = self._format_date_label
+        else:
+            build_label = format_folder_label
+        return SectionedFiles(
+            files=matching_files, sections=split_into_sections(matching_files, build_label=build_label)
+        )
 
-    def _build_duplicate_view(self) -> DuplicateView:
+    def _format_rating_label(self, media_file: MediaFile) -> str:
+        return describe_bucket(self.get_rating(media_file))
+
+    def _format_date_label(self, media_file: MediaFile) -> str:
+        return format_month_label(self._compute_sort_timestamp(media_file))
+
+    def _build_duplicate_view(self) -> SectionedFiles:
         """All members of every group that has at least one member matching the rating filter."""
         files_by_path = {media_file.relative_path: media_file for media_file in self._scan_result.files}
         visible_files: list[MediaFile] = []
-        group_starts: list[int] = []
+        sections: list[Section] = []
         for group in self._duplicate_groups:
             members = [
                 files_by_path[relative_path]
@@ -402,9 +450,16 @@ class RatingSession:
                 self._rating_filter.matches(self._ratings.get(member.relative_path)) for member in members
             ):
                 continue
-            group_starts.append(len(visible_files))
+            first_taken_at = datetime.fromtimestamp(self._compute_sort_timestamp(members[0]), UTC)
+            sections.append(
+                Section(
+                    label=f"group {len(sections) + 1} · {first_taken_at:%Y-%m-%d %H:%M}",
+                    start_index=len(visible_files),
+                    end_index=len(visible_files) + len(members),
+                )
+            )
             visible_files.extend(members)
-        return DuplicateView(files=visible_files, group_starts=group_starts)
+        return SectionedFiles(files=visible_files, sections=sections)
 
     def _restore_cursor(self, *, anchor_file: MediaFile | None, previous_index: int) -> None:
         if not self._visible_files:
@@ -417,8 +472,8 @@ class RatingSession:
                     return
         if anchor_file is not None and self._sort_order is SortOrder.PATH and not self._is_duplicates_mode:
             # Keep the place: the next file in path order.
-            sort_keys = [media_file.relative_path.lower() for media_file in self._visible_files]
-            anchor_index = bisect.bisect_left(sort_keys, anchor_file.relative_path.lower())
+            sort_keys = [build_path_sort_key(media_file.relative_path) for media_file in self._visible_files]
+            anchor_index = bisect.bisect_left(sort_keys, build_path_sort_key(anchor_file.relative_path))
             self._current_index = min(anchor_index, len(self._visible_files) - 1)
             return
         self._current_index = min(previous_index, len(self._visible_files) - 1)

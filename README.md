@@ -26,7 +26,8 @@ uv sync && uv run imgrate ~/Pictures/2025
 ```sh
 imgrate ~/Pictures/2025                       # rate (TUI)
 imgrate stats ~/Pictures/2025                 # counts per rating
-imgrate export ~/Pictures/2025 ~/calendar --min-rating 5 [--flat] [--symlink] [--dry-run]
+imgrate export ~/Pictures/2025 ~/calendar --min-rating 4 [--flat] [--symlink] [--dry-run]  # 4 and 5 stars
+imgrate export ~/Pictures/2025 ~/maybe --rating 3            # exactly 3 stars (repeatable; 0 = rejected)
 imgrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.g. read-only folder)
 ```
 
@@ -41,12 +42,13 @@ imgrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.
 | `→` `l` `space` / `←` `h` | next / previous |
 | `↓` `↑` | next / previous (grid: row) |
 | `pgdn` `pgup`, `home` `end` | jump 10 (grid: page), first / last |
+| `]` `.` / `[` `,` | next / previous section (folder, rating, month or duplicate group, depending on sort) |
 | `n` | next unrated |
 | `v` / `V` | cycle view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected |
 | `f` | choose any combination of ratings to view |
 | `s` | cycle sort: path · rating (best first) · date taken |
 | `g` | toggle thumbnail grid (`enter` opens the highlighted image) |
-| `d` | toggle duplicates mode (one group per grid page, `pgdn`/`pgup` = next/previous group) |
+| `d` | toggle duplicates mode (each group is a section) |
 | `b` | duplicates mode: keep this one, reject the rest of the group, jump to next group |
 | `e` | choose file formats |
 | `o` | open in the system viewer (also for videos) |
@@ -60,6 +62,12 @@ differ in ≤ 10 bits and they were taken ≤ 15 minutes apart (EXIF capture tim
 catches bursts, re-saved and resized copies; it misses the same scene with a different crop or zoom.
 Indexing takes about 3–7 ms per photo, runs in the background on start, and is reused on later runs
 (recomputed only for changed files).
+
+### Sections
+
+The list is split into sections depending on the sort order: folders (path), ratings (rating), months
+(date taken) or duplicate groups. The grid shows a header line per section and starts each section on a new row;
+`]`/`.` and `[`/`,` jump between sections, also in the single-image view.
 
 Within a view the list stays stable while you rate, so rating through "unrated" doesn't make the cursor jump;
 press `v`/`f` again to re-apply the filter.

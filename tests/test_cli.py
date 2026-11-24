@@ -45,3 +45,21 @@ def test_flat_name_collision_uses_relative_path() -> None:
     second_name = build_unique_flat_name(relative_path="2024/IMG_1.jpg", used_names=used_names)
 
     assert (first_name, second_name) == ("IMG_1.jpg", "2024_IMG_1.jpg")
+
+
+def test_export_exact_ratings(photo_root: Path, tmp_path: Path) -> None:
+    store = RatingStore(photo_root / RatingStore.DEFAULT_FILE_NAME)
+    store.set_rating(relative_path="2023/a.jpg", rating=5)
+    store.set_rating(relative_path="2023/sub/c.png", rating=3)
+    store.set_rating(relative_path="2024/d.jpg", rating=0)
+    store.close()
+    destination = tmp_path / "threes_and_rejects"
+
+    exit_code = main(["export", str(photo_root), str(destination), "--rating", "3", "--rating", "0", "--flat"])
+
+    assert exit_code == 0
+    assert sorted(path.name for path in destination.iterdir()) == ["c.png", "d.jpg"]
+
+
+def test_export_rejects_out_of_range_rating(photo_root: Path, tmp_path: Path) -> None:
+    assert main(["export", str(photo_root), str(tmp_path / "x"), "--rating", "7"]) == 2
