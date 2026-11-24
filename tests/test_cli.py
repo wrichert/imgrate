@@ -9,6 +9,8 @@ from imgrate.store import RatingStore
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
 
 def test_export_copies_only_files_at_or_above_min_rating(photo_root: Path, tmp_path: Path) -> None:
     store = RatingStore(photo_root / RatingStore.DEFAULT_FILE_NAME)
@@ -64,3 +66,12 @@ def test_export_exact_ratings(photo_root: Path, tmp_path: Path) -> None:
 
 def test_export_rejects_out_of_range_rating(photo_root: Path, tmp_path: Path) -> None:
     assert main(["export", str(photo_root), str(tmp_path / "x"), "--rating", "7"]) == 2
+
+
+def test_missing_photo_folder_is_an_error_instead_of_scanning_the_current_directory(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    exit_code = main([])
+
+    assert exit_code == 2
+    assert "photo folder missing" in capsys.readouterr().err

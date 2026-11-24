@@ -1,4 +1,4 @@
-"""Command line entry point: ``imgrate [ROOT]``, ``imgrate stats ROOT``, ``imgrate export ROOT DEST``."""
+"""Command line entry point: ``imgrate ROOT``, ``imgrate stats ROOT``, ``imgrate export ROOT DEST``."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     rate_parser = subparsers.add_parser("rate", help="open the rating TUI (default command)")
-    rate_parser.add_argument("root", nargs="?", default=".", type=Path, help="photo folder (default: .)")
+    rate_parser.add_argument("root", type=Path, help="photo folder")
     _add_database_argument(rate_parser)
 
     stats_parser = subparsers.add_parser("stats", help="print rating counts")
@@ -47,10 +47,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    # `imgrate` and `imgrate ~/Photos` are shorthands for `imgrate rate ...`.
-    if not arguments or (arguments[0] not in SUBCOMMANDS and arguments[0] not in {"-h", "--help"}):
+    parser = build_parser()
+    if not arguments:
+        parser.print_usage(sys.stderr)
+        print("imgrate: error: photo folder missing, e.g. `imgrate ~/Pictures/2025`", file=sys.stderr)
+        return 2
+    # `imgrate ~/Photos` is shorthand for `imgrate rate ~/Photos`.
+    if arguments[0] not in SUBCOMMANDS and arguments[0] not in {"-h", "--help"}:
         arguments = ["rate", *arguments]
-    parsed = build_parser().parse_args(arguments)
+    parsed = parser.parse_args(arguments)
     root = parsed.root.expanduser().resolve()
     if not root.is_dir():
         print(f"imgrate: not a directory: {root}", file=sys.stderr)
