@@ -55,6 +55,7 @@ imgrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.
 | `E` | export: pick ratings, destination, flat / symlink (remembered for next time) |
 | `e` | choose file formats |
 | `o` | open in the system viewer (also for videos) |
+| `c` | copy the full path to the clipboard |
 | `r` | rescan folder |
 | `?` | help |
 

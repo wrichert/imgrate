@@ -277,6 +277,7 @@ HELP_TEXT = """\
   E              export: choose ratings, destination, flat / symlink
   e              choose file formats (e.g. exclude .mp4)
   o              open in system viewer
+  c              copy full path to clipboard
   a              toggle auto-advance
   r              rescan folder
   q              quit

@@ -14,6 +14,8 @@ from imgrate.store import RatingStore
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
+
 
 def test_fit_image_to_cells_keeps_aspect_ratio() -> None:
     cell_box = fit_image_to_cells(
@@ -171,3 +173,15 @@ async def test_starts_in_rating_sorted_grid_and_capital_s_resorts(session: Ratin
         await pilot.pause(0.3)
         assert [section.label for section in session.sections] == ["★★★★★", "unrated", "rejected"]
         assert len(app.query(".section-header")) == 3
+
+
+async def test_c_copies_full_path_to_clipboard(session: RatingSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("imgrate.app.shutil.which", lambda _command: None)  # no clipboard tool -> OSC 52 fallback
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.press("c")
+        await pilot.pause()
+        expected_path = str(session.resolve_path(session.current_file).resolve())
+
+    assert app.clipboard == expected_path

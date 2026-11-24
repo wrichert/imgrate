@@ -6,6 +6,7 @@ import functools
 import json
 import math
 import os
+import shutil
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -54,6 +55,7 @@ if TYPE_CHECKING:
 
 
 BYTES_PER_KILOBYTE = 1024
+CLIPBOARD_COMMANDS = (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +108,14 @@ def shorten_home_path(path: Path) -> str:
     home = os.path.expanduser("~")
     path_text = str(path)
     return "~" + path_text[len(home) :] if path_text.startswith(home) else path_text
+
+
+def find_clipboard_command() -> list[str] | None:
+    """First installed clipboard tool (macOS, Wayland, X11), or None."""
+    for command in CLIPBOARD_COMMANDS:
+        if shutil.which(command[0]) is not None:
+            return list(command)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -232,6 +242,7 @@ class ImageRaterApp(App[None]):
         Binding("E", "export", "Export"),
         Binding("e", "choose_extensions", "Formats"),
         Binding("o", "open_external", "Open ext"),
+        Binding("c", "copy_path", "Copy path"),
         Binding("a", "toggle_auto_advance", "Auto-adv", show=False),
         Binding("r", "rescan", "Rescan", show=False),
         Binding("question_mark", "help", "Help"),
@@ -416,6 +427,24 @@ class ImageRaterApp(App[None]):
             )
         except OSError as error:
             self.notify(f"Cannot open: {error}", severity="error")
+
+    def action_copy_path(self) -> None:
+        """Copy the absolute path via the system clipboard tool; OSC 52 (terminal clipboard) as a fallback."""
+        current_file = self._session.current_file
+        if current_file is None:
+            return
+        full_path = str(self._session.resolve_path(current_file).resolve())
+        clipboard_command = find_clipboard_command()
+        is_copied = False
+        if clipboard_command is not None:
+            try:
+                subprocess.run(clipboard_command, input=full_path, text=True, check=True, timeout=5)
+                is_copied = True
+            except (OSError, subprocess.SubprocessError):
+                is_copied = False
+        if not is_copied:
+            self.copy_to_clipboard(full_path)
+        self.notify(f"Copied {full_path}", timeout=3)
 
     def action_toggle_auto_advance(self) -> None:
         self._is_auto_advance = not self._is_auto_advance
