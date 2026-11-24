@@ -47,8 +47,9 @@ imgrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.
 | `n` | next unrated |
 | `v` / `V` | cycle view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected |
 | `f` | choose any combination of ratings to view |
-| `s` | cycle sort: path · rating (best first) · date taken |
-| `g` | toggle thumbnail grid (`enter` opens the highlighted image) |
+| `s` | cycle sort: rating (best first, default) · date taken · path |
+| `S` | re-sort / re-filter now (re-rated photos move to their new section) |
+| `g` | toggle thumbnail grid (default) / single image (`enter` in the grid opens the highlighted image) |
 | `d` | toggle duplicates mode (each group is a section) |
 | `b` | duplicates mode: keep this one, reject the rest of the group, jump to next group |
 | `E` | export: pick ratings, destination, flat / symlink (remembered for next time) |
@@ -72,8 +73,8 @@ The list is split into sections depending on the sort order: folders (path), rat
 `J`/`K` (or `]`/`.` and `[`/`,`) jump between sections, also in the single-image view. The sidebar lists the
 sections around the current one with their sizes.
 
-Within a view the list stays stable while you rate, so rating through "unrated" doesn't make the cursor jump;
-press `v`/`f` again to re-apply the filter.
+The app starts in the grid, sorted by rating. Within a view the list stays stable while you rate, so rating
+doesn't make the cursor jump; press `S` to re-sort and re-filter (re-rated photos move to their new section).
 
 ### Suggested workflow for a calendar
 

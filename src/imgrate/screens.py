@@ -263,8 +263,9 @@ HELP_TEXT = """\
 [b]Review[/b]
   v / V          cycle rating view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected
   f              choose rating view (any combination)
-  s              cycle sort: path · rating (best first) · date taken — also sets the sections
-  g              toggle thumbnail grid
+  s              cycle sort: rating (best first, default) · date taken · path — also sets the sections
+  S              re-sort / re-filter now (re-rated files move to their new section)
+  g              toggle thumbnail grid (default) / single image
   enter          grid → open highlighted image
 
 [b]Near duplicates[/b]  (fingerprints are computed in the background, once)

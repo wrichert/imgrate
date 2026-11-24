@@ -327,6 +327,10 @@ class RatingSession:
 
     # ------------------------------------------------------------- view setup
 
+    def refresh_view(self) -> None:
+        """Re-apply filter and sort to the current ratings (e.g. move re-rated files into their new section)."""
+        self._rebuild_visible_files()
+
     def set_rating_filter(self, rating_filter: RatingFilter) -> None:
         self._rating_filter = rating_filter
         self._rebuild_visible_files()

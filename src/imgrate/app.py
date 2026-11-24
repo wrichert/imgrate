@@ -150,6 +150,7 @@ class ImageRaterApp(App[None]):
     """Rate thousands of photos fast; review any rating bucket; persist everything in SQLite."""
 
     TITLE = "imgrate"
+    DEFAULT_SORT_ORDER = SortOrder.RATING
     EXPORT_OPTIONS_SETTING_KEY = "export_options"
     SECTION_LIST_MAX_LINES = 9
     SECTION_LABEL_WIDTH = 20
@@ -166,7 +167,7 @@ class ImageRaterApp(App[None]):
     RESIZE_DEBOUNCE_SECONDS = 0.15
     FINGERPRINT_WORKER_COUNT = 2
     FINGERPRINT_BATCH_SIZE = 64
-    SORT_ORDERS: tuple[SortOrder, ...] = tuple(SortOrder)
+    SORT_ORDERS: tuple[SortOrder, ...] = (SortOrder.RATING, SortOrder.DATE, SortOrder.PATH)
 
     CSS = """
     Screen { layout: vertical; }
@@ -223,6 +224,7 @@ class ImageRaterApp(App[None]):
         Binding("V", "cycle_filter(-1)", "View back", show=False),
         Binding("f", "choose_filter", "Filter"),
         Binding("s", "cycle_sort", "Sort"),
+        Binding("S", "refresh_view", "Re-sort"),
         Binding("g", "toggle_grid", "Grid"),
         Binding("d", "toggle_duplicates", "Dupes"),
         Binding("b", "keep_best_of_group", "Best of group"),
@@ -243,7 +245,7 @@ class ImageRaterApp(App[None]):
         self._indexing_progress: IndexingProgress | None = None
         self._preview_cache = PreviewCache()
         self._is_auto_advance = True
-        self._is_grid_mode = False
+        self._is_grid_mode = True
         self._grid_layout_key: GridLayoutKey | None = None
         self._grid_rows: list[GridRow] = []
         self._grid_pages: list[GridPage] = []
@@ -266,6 +268,8 @@ class ImageRaterApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._session.set_sort_order(self.DEFAULT_SORT_ORDER)
+        self._apply_view_mode()
         self._refresh_all()
         self._start_fingerprint_indexing()
 
@@ -387,9 +391,13 @@ class ImageRaterApp(App[None]):
 
     def action_toggle_grid(self) -> None:
         self._is_grid_mode = not self._is_grid_mode
-        self.query_one("#viewer").display = not self._is_grid_mode
-        self.query_one("#grid").display = self._is_grid_mode
+        self._apply_view_mode()
         self.call_after_refresh(self._refresh_all)
+
+    def action_refresh_view(self) -> None:
+        self._session.refresh_view()
+        self.notify(f"Re-sorted ({self._session.visible_count:,} files)", timeout=2)
+        self._refresh_all()
 
     def action_open_from_grid(self) -> None:
         if self._is_grid_mode:
@@ -582,6 +590,10 @@ class ImageRaterApp(App[None]):
         return description
 
     # ----------------------------------------------------------------- helpers
+
+    def _apply_view_mode(self) -> None:
+        self.query_one("#viewer").display = not self._is_grid_mode
+        self.query_one("#grid").display = self._is_grid_mode
 
     def _move_to_next_unrated(self) -> None:
         if not self._session.move_to_next_unrated():

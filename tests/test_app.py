@@ -48,7 +48,6 @@ async def test_view_cycling_and_grid(session: RatingSession) -> None:
         await pilot.press("4", "0")
         await pilot.press("v")  # all -> unrated
         assert session.visible_count == 3
-        await pilot.press("g")
         await pilot.pause(0.3)
         await pilot.press("right", "2")
         await pilot.pause(0.3)
@@ -81,7 +80,6 @@ async def test_background_indexing_then_duplicates_mode_and_keep_best(
         await pilot.pause()
         assert session.duplicate_group_count == 2
         await pilot.press("d")
-        await pilot.press("g")
         await pilot.pause(0.3)
         assert len([cell for cell in app.query(ThumbnailCell) if cell.relative_path]) == 5
         assert len(app.query(".section-header")) == 2
@@ -100,16 +98,19 @@ async def test_sort_key_cycles(session: RatingSession) -> None:
     app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
 
     async with app.run_test(size=(140, 40)) as pilot:
+        assert session.sort_order is SortOrder.RATING  # default
         await pilot.press("s")
-        assert session.sort_order is SortOrder.RATING
+        assert session.sort_order is SortOrder.DATE
         await pilot.press("s", "s")
-        assert session.sort_order is SortOrder.PATH
+        assert session.sort_order is SortOrder.RATING
 
 
 async def test_shift_j_k_jump_sections_and_sidebar_lists_them(session: RatingSession) -> None:
     app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
 
     async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.press("s", "s")  # rating -> date -> path
+        assert session.sort_order is SortOrder.PATH
         await pilot.press("J")
         assert session.current_index == 2  # path sort: folders 2023 (2) | 2023/sub (1) | 2024 (2)
         await pilot.press("J", "K")
@@ -152,3 +153,21 @@ async def test_export_dialog_refuses_destination_inside_photo_folder(session: Ra
         assert isinstance(app.screen, ExportScreen)
 
     assert not (session.root / "picked").exists()
+
+
+async def test_starts_in_rating_sorted_grid_and_capital_s_resorts(session: RatingSession) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    # Tall enough for three sections (header + one thumbnail row each) on one grid page.
+    async with app.run_test(size=(140, 50)) as pilot:
+        await pilot.pause(0.3)
+        assert app.query_one("#grid").display
+        assert not app.query_one("#viewer").display
+        assert [section.label for section in session.sections] == ["unrated"]
+
+        await pilot.press("5", "x")
+        assert [section.label for section in session.sections] == ["unrated"]  # stable while rating
+        await pilot.press("S")
+        await pilot.pause(0.3)
+        assert [section.label for section in session.sections] == ["★★★★★", "unrated", "rejected"]
+        assert len(app.query(".section-header")) == 3
