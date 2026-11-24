@@ -2,9 +2,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from textual.widgets import Input, Static
+
 from imgrate.app import ImageRaterApp, ThumbnailCell, fit_image_to_cells
 from imgrate.media import scan_media_files
 from imgrate.ratings import REJECTED
+from imgrate.screens import ExportScreen
 from imgrate.session import RatingSession, SortOrder
 from imgrate.store import RatingStore
 
@@ -101,3 +104,51 @@ async def test_sort_key_cycles(session: RatingSession) -> None:
         assert session.sort_order is SortOrder.RATING
         await pilot.press("s", "s")
         assert session.sort_order is SortOrder.PATH
+
+
+async def test_shift_j_k_jump_sections_and_sidebar_lists_them(session: RatingSession) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.press("J")
+        assert session.current_index == 2  # path sort: folders 2023 (2) | 2023/sub (1) | 2024 (2)
+        await pilot.press("J", "K")
+        assert session.current_index == 2
+        sections_text = str(app.query_one("#sections", Static).render())
+        assert "2023/sub" in sections_text
+        assert "▶ 2023/sub" in sections_text
+
+
+async def test_export_dialog_exports_selected_ratings_and_remembers_options(
+    session: RatingSession, tmp_path: Path
+) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+    destination = tmp_path / "calendar"
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.press("5", "4", "5")  # a, b, c.png
+        await pilot.press("E")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, ExportScreen)
+        screen.query_one("#export-destination", Input).value = str(destination)
+        await pilot.press("ctrl+s")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    assert sorted(path.name for path in destination.iterdir()) == ["a.jpg", "c.png"]
+    assert str(destination) in (session.load_setting(ImageRaterApp.EXPORT_OPTIONS_SETTING_KEY) or "")
+
+
+async def test_export_dialog_refuses_destination_inside_photo_folder(session: RatingSession) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.press("5", "E")
+        await pilot.pause()
+        app.screen.query_one("#export-destination", Input).value = str(session.root / "picked")
+        await pilot.press("ctrl+s")
+        await pilot.pause()
+        assert isinstance(app.screen, ExportScreen)
+
+    assert not (session.root / "picked").exists()

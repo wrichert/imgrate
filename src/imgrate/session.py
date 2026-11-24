@@ -229,6 +229,20 @@ class RatingSession:
             )
         )
 
+    def find_relative_paths_with_ratings(self, buckets: frozenset[RatingBucket]) -> list[str]:
+        """Files of the enabled formats whose rating is in ``buckets`` (ignores the current view)."""
+        return [
+            media_file.relative_path
+            for media_file in self._scan_result.files
+            if self._is_eligible(media_file) and self.get_rating(media_file) in buckets
+        ]
+
+    def load_setting(self, key: str) -> str | None:
+        return self._store.load_setting(key)
+
+    def save_setting(self, *, key: str, value: str) -> None:
+        self._store.save_setting(key=key, value=value)
+
     def find_files_missing_fingerprints(self) -> list[MediaFile]:
         """Image files (any enabled state) without an up-to-date fingerprint."""
         return [

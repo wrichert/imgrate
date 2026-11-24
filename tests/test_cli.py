@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from imgrate.cli import build_unique_flat_name, main
+from imgrate.cli import main
+from imgrate.export import build_unique_flat_name
 from imgrate.store import RatingStore
 
 if TYPE_CHECKING:

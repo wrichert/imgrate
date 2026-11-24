@@ -10,6 +10,7 @@ Terminal UI to rate thousands of photos fast and keep only the best ones (e.g. f
 - Near-duplicate detection (bursts, re-saved or resized copies): perceptual hash computed once in the background
   and cached in SQLite; review one group at a time and keep the best with a single key
 - Review any rating bucket (unrated, rejected, ≥ N stars, any combination) in single view or as a thumbnail grid
+- Export from the app (`E`) or the shell, by copy or symlink, flat or with sub folders
 - Choose which file formats take part (images on by default; `.mp4`, `.mov`, RAW etc. off unless you enable them)
 - Export the keepers by copy or symlink
 
@@ -42,7 +43,7 @@ imgrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.
 | `→` `l` `space` / `←` `h` | next / previous |
 | `↓` `↑` | next / previous (grid: row) |
 | `pgdn` `pgup`, `home` `end` | jump 10 (grid: page), first / last |
-| `]` `.` / `[` `,` | next / previous section (folder, rating, month or duplicate group, depending on sort) |
+| `J` / `K` | next / previous section (folder, rating, month or duplicate group, depending on sort); also `]` `.` / `[` `,` |
 | `n` | next unrated |
 | `v` / `V` | cycle view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected |
 | `f` | choose any combination of ratings to view |
@@ -50,6 +51,7 @@ imgrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.
 | `g` | toggle thumbnail grid (`enter` opens the highlighted image) |
 | `d` | toggle duplicates mode (each group is a section) |
 | `b` | duplicates mode: keep this one, reject the rest of the group, jump to next group |
+| `E` | export: pick ratings, destination, flat / symlink (remembered for next time) |
 | `e` | choose file formats |
 | `o` | open in the system viewer (also for videos) |
 | `r` | rescan folder |
@@ -67,7 +69,8 @@ Indexing takes about 3–7 ms per photo, runs in the background on start, and is
 
 The list is split into sections depending on the sort order: folders (path), ratings (rating), months
 (date taken) or duplicate groups. The grid shows a header line per section and starts each section on a new row;
-`]`/`.` and `[`/`,` jump between sections, also in the single-image view.
+`J`/`K` (or `]`/`.` and `[`/`,`) jump between sections, also in the single-image view. The sidebar lists the
+sections around the current one with their sizes.
 
 Within a view the list stays stable while you rate, so rating through "unrated" doesn't make the cursor jump;
 press `v`/`f` again to re-apply the filter.
@@ -78,7 +81,7 @@ press `v`/`f` again to re-apply the filter.
    Press `d` again to leave.
 2. View **unrated**, go through quickly: `x` for rejects, `3` for "maybe", `4`/`5` for good ones.
 3. View **≥ ★★★★** in grid mode (`g`), compare, promote the best to `5`, demote the rest.
-4. View **★★★★★ only**, `s` to sort by date taken, until 12–13 remain, then `imgrate export ROOT ~/calendar --min-rating 5 --flat`.
+4. View **★★★★★ only**, `s` to sort by date taken (one section per month), until 12–13 remain, then `E` to export.
 
 ## Development
 

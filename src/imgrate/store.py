@@ -139,5 +139,16 @@ class RatingStore:
         )
         self._connection.commit()
 
+    def load_setting(self, key: str) -> str | None:
+        row = self._connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return None if row is None else row[0]
+
+    def save_setting(self, *, key: str, value: str) -> None:
+        self._connection.execute(
+            "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+        self._connection.commit()
+
     def close(self) -> None:
         self._connection.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import math
 import os
 import subprocess
@@ -21,6 +22,7 @@ from textual.worker import get_current_worker
 from textual_image.widget import Image as ImageWidget
 from textual_image.widget import get_cell_size
 
+from imgrate.export import ExportOptions, ExportSummary, export_files
 from imgrate.fingerprints import Fingerprint, compute_image_signature
 from imgrate.grid_layout import (
     GridPage,
@@ -33,7 +35,7 @@ from imgrate.grid_layout import (
 from imgrate.media import scan_media_files
 from imgrate.preview import PreviewCache
 from imgrate.ratings import ALL_BUCKETS, FILTER_PRESETS, MAX_STARS, REJECTED, describe_bucket, format_stars
-from imgrate.screens import ExtensionsScreen, HelpScreen, RatingFilterScreen
+from imgrate.screens import ExportRequest, ExportScreen, ExtensionsScreen, HelpScreen, RatingFilterScreen
 from imgrate.session import SortOrder
 from imgrate.store import RatingStore
 
@@ -95,6 +97,11 @@ def format_size(size_bytes: int) -> str:
     return f"{size_value:.1f} GB"
 
 
+def truncate_from_left(text: str, *, max_length: int) -> str:
+    """Keep the end of long labels (folder names are most specific at the end)."""
+    return text if len(text) <= max_length else "…" + text[-(max_length - 1) :]
+
+
 def shorten_home_path(path: Path) -> str:
     home = os.path.expanduser("~")
     path_text = str(path)
@@ -143,6 +150,9 @@ class ImageRaterApp(App[None]):
     """Rate thousands of photos fast; review any rating bucket; persist everything in SQLite."""
 
     TITLE = "imgrate"
+    EXPORT_OPTIONS_SETTING_KEY = "export_options"
+    SECTION_LIST_MAX_LINES = 9
+    SECTION_LABEL_WIDTH = 20
     PREVIEW_EDGE_STEP_PX = 256
     PREVIEW_MIN_EDGE_PX = 512
     PREVIEW_MAX_EDGE_PX = 1920
@@ -165,7 +175,7 @@ class ImageRaterApp(App[None]):
     #preview { width: auto; height: auto; }
     #placeholder { width: 100%; height: 100%; content-align: center middle; color: $text-muted; }
     #grid { width: 1fr; height: 1fr; display: none; }
-    .section-header { height: 1; padding: 0 1; background: $boost; color: $accent; text-style: bold; }
+    .section-header { height: 1; padding: 0 1; background: $accent 35%; color: $text; text-style: bold; }
     .thumbnail-row { height: 13; }
     .thumbnail { border: round $panel; height: 100%; width: 1fr; }
     .thumbnail.empty { border: none; }
@@ -181,7 +191,7 @@ class ImageRaterApp(App[None]):
     .dialog .buttons { height: auto; align-horizontal: right; }
     .dialog Button { margin-left: 1; }
     .help { width: 84; }
-    ExtensionsScreen, RatingFilterScreen, HelpScreen { align: center middle; }
+    ExtensionsScreen, RatingFilterScreen, ExportScreen, HelpScreen { align: center middle; }
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -191,8 +201,8 @@ class ImageRaterApp(App[None]):
         Binding("up,k", "move_row(-1)", "Up", show=False),
         Binding("pagedown", "move_page(1)", "Page down", show=False),
         Binding("pageup", "move_page(-1)", "Page up", show=False),
-        Binding("right_square_bracket,full_stop", "move_section(1)", "Next section", key_display="] ."),
-        Binding("left_square_bracket,comma", "move_section(-1)", "Prev section", show=False),
+        Binding("J,right_square_bracket,full_stop", "move_section(1)", "Section ↓", key_display="J"),
+        Binding("K,left_square_bracket,comma", "move_section(-1)", "Section ↑", key_display="K"),
         Binding("home", "move_to_start", "First", show=False),
         Binding("end", "move_to_end", "Last", show=False),
         *(
@@ -217,6 +227,7 @@ class ImageRaterApp(App[None]):
         Binding("d", "toggle_duplicates", "Dupes"),
         Binding("b", "keep_best_of_group", "Best of group"),
         Binding("enter", "open_from_grid", "Open", show=False),
+        Binding("E", "export", "Export"),
         Binding("e", "choose_extensions", "Formats"),
         Binding("o", "open_external", "Open ext"),
         Binding("a", "toggle_auto_advance", "Auto-adv", show=False),
@@ -248,6 +259,7 @@ class ImageRaterApp(App[None]):
             yield Container(id="grid")
             with Vertical(id="sidebar"):
                 yield Static(id="info")
+                yield Static(id="sections")
                 yield Static(id="counts")
                 yield Static(id="settings")
         yield Static(id="statusbar")
@@ -406,6 +418,25 @@ class ImageRaterApp(App[None]):
         self.notify("Rescanning…")
         self.run_worker(self._rescan, thread=True, exclusive=True, group="scan")
 
+    def action_export(self) -> None:
+        current_filter_buckets = self._session.rating_filter.buckets
+        initial_buckets = (
+            frozenset({MAX_STARS}) if current_filter_buckets == frozenset(ALL_BUCKETS) else current_filter_buckets
+        )
+        saved_options = json.loads(self._session.load_setting(self.EXPORT_OPTIONS_SETTING_KEY) or "{}")
+        default_destination = self._session.root.parent / f"{self._session.root.name}-selection"
+        self.push_screen(
+            ExportScreen(
+                root=self._session.root,
+                rating_counts=self._session.count_ratings(),
+                initial_buckets=initial_buckets,
+                initial_destination=saved_options.get("destination", shorten_home_path(default_destination)),
+                is_flat=saved_options.get("is_flat", True),
+                is_symlink=saved_options.get("is_symlink", False),
+            ),
+            self._handle_export_requested,
+        )
+
     def action_help(self) -> None:
         self.push_screen(HelpScreen())
 
@@ -414,6 +445,46 @@ class ImageRaterApp(App[None]):
     def _handle_filter_chosen(self, rating_filter: RatingFilter | None) -> None:
         if rating_filter is not None:
             self._apply_filter(rating_filter)
+
+    def _handle_export_requested(self, request: ExportRequest | None) -> None:
+        if request is None:
+            return
+        self._session.save_setting(
+            key=self.EXPORT_OPTIONS_SETTING_KEY,
+            value=json.dumps(
+                {
+                    "destination": shorten_home_path(request.options.destination),
+                    "is_flat": request.options.is_flat,
+                    "is_symlink": request.options.is_symlink,
+                }
+            ),
+        )
+        relative_paths = self._session.find_relative_paths_with_ratings(request.buckets)
+        if not relative_paths:
+            self.notify("No files with these ratings", severity="warning")
+            return
+        self.notify(f"Exporting {len(relative_paths):,} files…")
+        self.run_worker(
+            functools.partial(self._run_export, relative_paths, request.options),
+            thread=True,
+            group="export",
+        )
+
+    def _run_export(self, relative_paths: list[str], options: ExportOptions) -> None:
+        try:
+            summary = export_files(root=self._session.root, relative_paths=relative_paths, options=options)
+        except (OSError, ValueError) as error:
+            self.call_from_thread(self.notify, f"Export failed: {error}", severity="error", timeout=10)
+            return
+        self.call_from_thread(self._handle_export_done, summary, options)
+
+    def _handle_export_done(self, summary: ExportSummary, options: ExportOptions) -> None:
+        message = f"Exported {summary.exported_count:,} files to {shorten_home_path(options.destination)}"
+        if summary.skipped_existing_count:
+            message += f" ({summary.skipped_existing_count:,} already there)"
+        if summary.missing_count:
+            message += f" ({summary.missing_count:,} missing on disk)"
+        self.notify(message, timeout=8)
 
     def _handle_extensions_chosen(self, extensions: set[str] | None) -> None:
         if extensions is None:
@@ -572,6 +643,7 @@ class ImageRaterApp(App[None]):
 
     def _refresh_sidebar(self) -> None:
         self.query_one("#info", Static).update(self._build_info_text())
+        self.query_one("#sections", Static).update(self._build_sections_text())
         self.query_one("#counts", Static).update(self._build_counts_text())
         self.query_one("#settings", Static).update(self._build_settings_text())
 
@@ -600,6 +672,37 @@ class ImageRaterApp(App[None]):
             modified_at = datetime.fromtimestamp(current_file.modified_timestamp_utc).astimezone()
             info_text.append(f"\nmodified {modified_at:%Y-%m-%d %H:%M}", style="dim")
         return info_text
+
+    def _build_sections_text(self) -> Text:
+        """Window of the section list around the current section."""
+        sections = self._session.sections
+        section_position = self._session.current_section_position
+        if section_position is None:
+            return Text("")
+        title = (
+            "Duplicate groups" if self._session.is_duplicates_mode else f"Sections ({self._session.sort_order.value})"
+        )
+        sections_text = Text.assemble((title, "bold"), (f"  {len(sections):,}  J/K\n", "dim"))
+        current_offset = section_position.section_number - 1
+        window_start = max(
+            0,
+            min(current_offset - self.SECTION_LIST_MAX_LINES // 2, len(sections) - self.SECTION_LIST_MAX_LINES),
+        )
+        window_end = min(len(sections), window_start + self.SECTION_LIST_MAX_LINES)
+        if window_start > 0:
+            sections_text.append(f"  … {window_start:,} more\n", style="dim")
+        for offset in range(window_start, window_end):
+            section = sections[offset]
+            label = truncate_from_left(section.label, max_length=self.SECTION_LABEL_WIDTH)
+            line = f"{label:<{self.SECTION_LABEL_WIDTH}} {section.size:>6,}"
+            if offset == current_offset:
+                sections_text.append(f"▶ {line}\n", style="bold reverse")
+            else:
+                sections_text.append(f"  {line}\n")
+        if window_end < len(sections):
+            sections_text.append(f"  … {len(sections) - window_end:,} more\n", style="dim")
+        sections_text.rstrip()
+        return sections_text
 
     def _build_counts_text(self) -> Text:
         rating_counts = self._session.count_ratings()

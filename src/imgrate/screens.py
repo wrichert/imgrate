@@ -1,15 +1,18 @@
-"""Modal screens: format selection, rating filter, help."""
+"""Modal screens: format selection, rating filter, export, help."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
-from textual.widgets import Button, Label, SelectionList, Static
+from textual.widgets import Button, Checkbox, Input, Label, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
+from imgrate.export import ExportOptions, validate_destination
 from imgrate.media import IMAGE_EXTENSIONS, RAW_EXTENSIONS, VIDEO_EXTENSIONS
 from imgrate.ratings import ALL_BUCKETS, RatingBucket, RatingFilter, build_custom_filter, describe_bucket
 
@@ -136,6 +139,112 @@ class RatingFilterScreen(ModalScreen[RatingFilter | None]):
         self.dismiss(None)
 
 
+@dataclass(frozen=True, slots=True)
+class ExportRequest:
+    buckets: frozenset[RatingBucket]
+    options: ExportOptions
+
+
+class ExportScreen(ModalScreen[ExportRequest | None]):
+    """Choose ratings, destination and copy mode; the export itself runs in the app."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "Cancel"),
+        Binding("ctrl+s", "apply", "Export", priority=True),
+    ]
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        rating_counts: dict[RatingBucket, int],
+        initial_buckets: frozenset[RatingBucket],
+        initial_destination: str,
+        is_flat: bool,
+        is_symlink: bool,
+    ) -> None:
+        super().__init__()
+        self._root = root
+        self._rating_counts = rating_counts
+        self._initial_buckets = initial_buckets
+        self._initial_destination = initial_destination
+        self._is_flat = is_flat
+        self._is_symlink = is_symlink
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label("Export  [dim](space toggles · tab moves · enter / ctrl+s exports · esc cancels)[/]")
+            yield SelectionList[int](
+                *(
+                    Selection(
+                        f"{describe_bucket(bucket):<9} {self._rating_counts.get(bucket, 0):>7,}",
+                        index,
+                        bucket in self._initial_buckets,
+                    )
+                    for index, bucket in reversed(list(enumerate(ALL_BUCKETS)))
+                ),
+                id="export-ratings",
+            )
+            yield Label("Destination folder")
+            yield Input(self._initial_destination, id="export-destination")
+            yield Checkbox("One flat folder (no sub folders)", self._is_flat, id="export-flat")
+            yield Checkbox("Symlinks instead of copies", self._is_symlink, id="export-symlink")
+            yield Static("", id="export-summary")
+            with Horizontal(classes="buttons"):
+                yield Button("Export", variant="primary", id="apply")
+                yield Button("Cancel", id="cancel")
+
+    def on_mount(self) -> None:
+        self._update_summary()
+
+    def on_selection_list_selected_changed(self) -> None:
+        self._update_summary()
+
+    def on_input_submitted(self) -> None:
+        self.action_apply()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "apply":
+            self.action_apply()
+        else:
+            self.action_cancel()
+
+    def action_apply(self) -> None:
+        buckets = self._selected_buckets()
+        if not buckets:
+            self.notify("Select at least one rating", severity="warning")
+            return
+        destination_text = self.query_one("#export-destination", Input).value.strip()
+        if not destination_text:
+            self.notify("Enter a destination folder", severity="warning")
+            return
+        try:
+            destination = validate_destination(root=self._root, destination=Path(destination_text))
+        except ValueError as error:
+            self.notify(str(error), severity="error")
+            return
+        self.dismiss(
+            ExportRequest(
+                buckets=buckets,
+                options=ExportOptions(
+                    destination=destination,
+                    is_flat=self.query_one("#export-flat", Checkbox).value,
+                    is_symlink=self.query_one("#export-symlink", Checkbox).value,
+                ),
+            )
+        )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+    def _selected_buckets(self) -> frozenset[RatingBucket]:
+        return frozenset(ALL_BUCKETS[index] for index in self.query_one("#export-ratings", SelectionList).selected)
+
+    def _update_summary(self) -> None:
+        file_count = sum(self._rating_counts.get(bucket, 0) for bucket in self._selected_buckets())
+        self.query_one("#export-summary", Static).update(f"[b]{file_count:,}[/b] files will be exported")
+
+
 HELP_TEXT = """\
 [b]Rating[/b]
   1 … 5          rate (auto-advances when auto-advance is on)
@@ -147,9 +256,9 @@ HELP_TEXT = """\
   → l space      next          ← h          previous
   ↓ / ↑          next / previous (grid: row down / up)
   pgdn / pgup    jump 10 (grid: page)
-  ] . / [ ,      next / previous section (folder · rating · month · duplicate group)
   home / end     first / last
   n              next unrated
+  J / K          next / previous section   (also ] . and [ ,)
 
 [b]Review[/b]
   v / V          cycle rating view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected
@@ -164,6 +273,7 @@ HELP_TEXT = """\
   v / f          in duplicates mode: show groups with at least one matching member
 
 [b]Other[/b]
+  E              export: choose ratings, destination, flat / symlink
   e              choose file formats (e.g. exclude .mp4)
   o              open in system viewer
   a              toggle auto-advance
@@ -171,8 +281,7 @@ HELP_TEXT = """\
   q              quit
 
 Ratings are saved immediately to the SQLite file shown in the sidebar.
-Export:  imgrate export ROOT DEST --min-rating 4      (4 and 5 stars)
-         imgrate export ROOT DEST --rating 3          (exactly 3; repeatable, 0 = rejected)
+Export from the shell:  imgrate export ROOT DEST --rating 5   (repeatable; or --min-rating 4)
 """
 
 
