@@ -299,6 +299,7 @@ class ImageRaterApp(App[None]):
 
     def on_mount(self) -> None:
         self._session.set_sort_order(self.DEFAULT_SORT_ORDER)
+        self._session.move_to_first_unrated()
         self._apply_view_mode()
         self._refresh_all()
         self._start_fingerprint_indexing()

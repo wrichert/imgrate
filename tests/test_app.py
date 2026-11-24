@@ -255,3 +255,15 @@ async def test_rejecting_updates_both_section_counts_in_sidebar_and_grid_headers
     assert re.search(rf"unrated\s+{unrated_count} ↻", sections_text)
     assert re.search(r"rejected\s+2 ↻", sections_text)
     assert any(text.startswith("rejected   2 files") and "1 in, 0 out" in text for text in header_texts)
+
+
+async def test_starts_on_first_unrated_file(session: RatingSession) -> None:
+    session.rate(session.visible_files[0], rating=4)
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 40)):
+        current_rating = session.current_rating
+        current_index = session.current_index
+
+    assert current_rating is None
+    assert current_index == 1  # rating sort: the 4-star file first, then the unrated ones

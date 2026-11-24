@@ -306,6 +306,17 @@ class RatingSession:
                 return True
         return False
 
+    def move_to_first_unrated(self) -> None:
+        """First unrated file in the visible order, or the first file if everything is rated."""
+        self._current_index = next(
+            (
+                index
+                for index, media_file in enumerate(self._visible_files)
+                if media_file.relative_path not in self._ratings
+            ),
+            0,
+        )
+
     # ----------------------------------------------------------------- ratings
 
     def rate_current(self, rating: int | None) -> RatingChange | None:

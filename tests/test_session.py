@@ -149,3 +149,23 @@ def test_leaving_the_rating_filter_counts_as_moved_out(session: RatingSession) -
     folder_counts = session.count_section_members(folder_section)
 
     assert (folder_counts.member_count, folder_counts.moved_out_count) == (folder_section.size - 1, 1)
+
+
+def test_move_to_first_unrated_skips_rated_files(session: RatingSession) -> None:
+    session.rate(session.visible_files[0], rating=5)
+    session.rate(session.visible_files[1], rating=REJECTED)
+    session.move_to(3)
+
+    session.move_to_first_unrated()
+
+    assert session.current_index == 2
+
+
+def test_move_to_first_unrated_falls_back_to_first_file(session: RatingSession) -> None:
+    for media_file in session.visible_files:
+        session.rate(media_file, rating=3)
+    session.move_to(2)
+
+    session.move_to_first_unrated()
+
+    assert session.current_index == 0
