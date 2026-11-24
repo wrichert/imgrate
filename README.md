@@ -92,3 +92,14 @@ uv sync
 uv run pytest
 uv run ruff check . && uv run ruff format .
 ```
+
+## Disclaimer
+
+Use at your own risk. imgrate only reads your photos and never deletes, moves or modifies them: ratings live in a
+separate SQLite file and export copies or links files without overwriting existing ones. Still, this software comes
+without any warranty, and the author accepts no liability for lost data or any other damage. Keep a backup of your
+photos.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
