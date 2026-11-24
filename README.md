@@ -94,6 +94,7 @@ sections around the current one with their sizes.
 
 The app starts in the grid, sorted by rating. Within a view the list stays stable while you rate, so rating
 doesn't make the cursor jump; press `S` to re-sort and re-filter (re-rated photos move to their new section).
+Section counts are live: a section with re-rated photos waiting for `S` is marked with ↻.
 
 ### Suggested workflow for a calendar
 

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from PIL import Image
 from textual.widgets import Input, Static
 
-from imgrate.app import ImageRaterApp, ThumbnailCell, fit_image_to_cells
+from imgrate.app import ImageRaterApp, SectionHeader, ThumbnailCell, fit_image_to_cells
 from imgrate.media import scan_media_files
 from imgrate.ratings import REJECTED
 from imgrate.screens import ExportScreen
@@ -236,3 +237,18 @@ async def test_fast_scrolling_through_grid_pages_does_not_crash(tmp_path: Path) 
         index_at_end = session.current_index
 
     assert index_at_end == 0
+
+
+async def test_rating_updates_section_counts_in_sidebar_and_grid_header(session: RatingSession) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 50)) as pilot:
+        await pilot.pause(0.3)
+        await pilot.press("3")
+        await pilot.pause(0.3)
+        sections_text = str(app.query_one("#sections", Static).render())
+        header_texts = [str(header.render()) for header in app.query(SectionHeader)]
+
+    unrated_count = session.visible_count - 1
+    assert re.search(rf"unrated\s+{unrated_count} ↻", sections_text)
+    assert any(f"{unrated_count} files" in text and "1 re-rated" in text for text in header_texts)

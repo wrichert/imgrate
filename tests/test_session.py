@@ -6,7 +6,7 @@ import pytest
 
 from imgrate.media import scan_media_files
 from imgrate.ratings import ALL_FILTER, REJECTED, UNRATED_FILTER, build_minimum_stars_filter
-from imgrate.session import RatingSession
+from imgrate.session import RatingSession, SortOrder
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -122,3 +122,25 @@ def test_empty_view_has_no_current_file(session: RatingSession) -> None:
 def test_invalid_rating_is_rejected(store: RatingStore) -> None:
     with pytest.raises(ValueError, match="Rating must be"):
         store.set_rating(relative_path="a.jpg", rating=7)
+
+
+def test_rating_counts_pending_resort_until_refresh(session: RatingSession) -> None:
+    session.set_sort_order(SortOrder.RATING)
+    unrated_section = session.sections[0]
+
+    session.rate(session.visible_files[0], rating=4)
+    pending_before_refresh = session.count_pending_resort(unrated_section)
+    session.refresh_view()
+    pending_after_refresh = [session.count_pending_resort(section) for section in session.sections]
+
+    assert pending_before_refresh == 1
+    assert pending_after_refresh == [0, 0]
+
+
+def test_leaving_the_rating_filter_counts_as_pending_resort(session: RatingSession) -> None:
+    session.set_rating_filter(UNRATED_FILTER)
+    folder_section = session.sections[0]
+
+    session.rate(session.visible_files[0], rating=REJECTED)
+
+    assert session.count_pending_resort(folder_section) == 1

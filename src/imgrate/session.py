@@ -213,6 +213,18 @@ class RatingSession:
 
     # ----------------------------------------------------------------- queries
 
+    def count_pending_resort(self, section: Section) -> int:
+        """Members re-rated since the last rebuild so that they now belong elsewhere (another rating section,
+        or outside the rating filter). They stay in place until ``refresh_view`` (S). Always 0 for duplicate groups.
+        """
+        if self._is_duplicates_mode:
+            return 0
+        return sum(
+            1
+            for media_file in self._visible_files[section.start_index : section.end_index]
+            if self._has_left_section(media_file, section=section)
+        )
+
     def get_rating(self, media_file: MediaFile) -> int | None:
         return self._ratings.get(media_file.relative_path)
 
@@ -446,6 +458,12 @@ class RatingSession:
         return SectionedFiles(
             files=matching_files, sections=split_into_sections(matching_files, build_label=build_label)
         )
+
+    def _has_left_section(self, media_file: MediaFile, *, section: Section) -> bool:
+        rating = self.get_rating(media_file)
+        if not self._rating_filter.matches(rating):
+            return True
+        return self._sort_order is SortOrder.RATING and describe_bucket(rating) != section.label
 
     def _format_rating_label(self, media_file: MediaFile) -> str:
         return describe_bucket(self.get_rating(media_file))

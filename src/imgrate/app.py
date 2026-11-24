@@ -142,6 +142,14 @@ def build_rating_text(rating: int | None) -> Text:
     return Text(stars, style="bold yellow")
 
 
+class SectionHeader(Static):
+    """Separator line above a section in the grid; re-rendered after every rating to keep its counts live."""
+
+    def __init__(self, header_text: Text, *, row: GridRow) -> None:
+        super().__init__(header_text, classes="section-header")
+        self.row = row
+
+
 class ThumbnailCell(Vertical):
     """One tile of the grid: thumbnail plus rating line. ``file_index`` is ``None`` for padding tiles."""
 
@@ -752,13 +760,17 @@ class ImageRaterApp(App[None]):
         for offset in range(window_start, window_end):
             section = sections[offset]
             label = truncate_from_left(section.label, max_length=self.SECTION_LABEL_WIDTH)
-            line = f"{label:<{self.SECTION_LABEL_WIDTH}} {section.size:>6,}"
+            pending_count = self._session.count_pending_resort(section)
+            pending_marker = " ↻" if pending_count else ""
+            line = f"{label:<{self.SECTION_LABEL_WIDTH}} {section.size - pending_count:>6,}{pending_marker}"
             if offset == current_offset:
                 sections_text.append(f"▶ {line}\n", style="bold reverse")
             else:
                 sections_text.append(f"  {line}\n")
         if window_end < len(sections):
             sections_text.append(f"  … {len(sections) - window_end:,} more\n", style="dim")
+        if any(self._session.count_pending_resort(section) for section in sections[window_start:window_end]):
+            sections_text.append("  ↻ re-rated, S re-sorts\n", style="yellow")
         sections_text.rstrip()
         return sections_text
 
@@ -905,7 +917,7 @@ class ImageRaterApp(App[None]):
         widgets: list[Widget] = []
         for row in page.rows:
             if row.is_header:
-                widgets.append(Static(self._build_section_header_text(row), classes="section-header"))
+                widgets.append(SectionHeader(self._build_section_header_text(row), row=row))
                 continue
             file_indices = list(range(row.start_index, row.end_index))
             padding = [None] * (column_count - len(file_indices))
@@ -919,11 +931,16 @@ class ImageRaterApp(App[None]):
 
     def _build_section_header_text(self, row: GridRow) -> Text:
         section_number = self._session.sections.index(row.section) + 1
-        return Text.assemble(
+        pending_count = self._session.count_pending_resort(row.section)
+        current_count = row.section.size - pending_count
+        header_text = Text.assemble(
             (row.section.label, "bold"),
-            (f"   {row.section.size:,} {'file' if row.section.size == 1 else 'files'}", ""),
+            (f"   {current_count:,} {'file' if current_count == 1 else 'files'}", ""),
             (f"   section {section_number}/{len(self._session.sections)}", "dim"),
         )
+        if pending_count:
+            header_text.append(f"   ↻ {pending_count:,} re-rated · S re-sorts", style="yellow")
+        return header_text
 
     def _fill_grid(self) -> None:
         grid = self._find_grid()
@@ -932,6 +949,8 @@ class ImageRaterApp(App[None]):
         visible_files = self._session.visible_files
         cell_columns = max(1, grid.content_size.width // max(1, self._grid_layout_key.column_count) - 2)
         cell_rows = self.THUMBNAIL_HEIGHT_CELLS - 3  # border + rating line
+        for header in grid.query(SectionHeader):
+            header.update(self._build_section_header_text(header.row))
         for cell in grid.query(ThumbnailCell):
             if cell.file_index is None or cell.file_index >= len(visible_files):
                 continue
