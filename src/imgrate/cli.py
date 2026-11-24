@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import sys
 from dataclasses import dataclass
@@ -92,7 +91,7 @@ def run_tui(*, root: Path, database_path: Path) -> int:
     store = RatingStore(database_path)
     try:
         session = RatingSession(scan_result=scan_result, store=store)
-        ImageRaterApp(session=session, database_label=f"db: {_shorten_home(database_path)}").run()
+        ImageRaterApp(session=session, database_path=database_path).run()
     finally:
         store.close()
     return 0
@@ -160,9 +159,3 @@ def _add_database_argument(parser: argparse.ArgumentParser) -> None:
         default=None,
         help=f"SQLite file (default: ROOT/{RatingStore.DEFAULT_FILE_NAME})",
     )
-
-
-def _shorten_home(path: Path) -> str:
-    home = os.path.expanduser("~")
-    path_text = str(path)
-    return "~" + path_text[len(home) :] if path_text.startswith(home) else path_text

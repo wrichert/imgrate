@@ -6,6 +6,9 @@ Terminal UI to rate thousands of photos fast and keep only the best ones (e.g. f
 - Real image previews in the terminal: Kitty graphics protocol (Ghostty, Kitty, WezTerm), Sixel (iTerm2, foot, …), unicode fallback elsewhere
 - Background decoding + prefetch of the next images, JPEG draft-mode decoding (24 MP → ~25 ms), EXIF orientation, HEIC/HEIF
 - Ratings stored immediately in SQLite (`ROOT/.imgrate.sqlite`), keyed by path relative to the root, so the folder can be moved
+- Sort by path, rating (best first) or date taken
+- Near-duplicate detection (bursts, re-saved or resized copies): perceptual hash computed once in the background
+  and cached in SQLite; review one group at a time and keep the best with a single key
 - Review any rating bucket (unrated, rejected, ≥ N stars, any combination) in single view or as a thumbnail grid
 - Choose which file formats take part (images on by default; `.mp4`, `.mov`, RAW etc. off unless you enable them)
 - Export the keepers by copy or symlink
@@ -41,20 +44,33 @@ imgrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.
 | `n` | next unrated |
 | `v` / `V` | cycle view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected |
 | `f` | choose any combination of ratings to view |
+| `s` | cycle sort: path · rating (best first) · date taken |
 | `g` | toggle thumbnail grid (`enter` opens the highlighted image) |
+| `d` | toggle duplicates mode (one group per grid page, `pgdn`/`pgup` = next/previous group) |
+| `b` | duplicates mode: keep this one, reject the rest of the group, jump to next group |
 | `e` | choose file formats |
 | `o` | open in the system viewer (also for videos) |
 | `r` | rescan folder |
 | `?` | help |
+
+### Near duplicates
+
+Each image gets a 64-bit difference hash (grayscale 9×8 thumbnail). Two images are grouped when their hashes
+differ in ≤ 10 bits and they were taken ≤ 15 minutes apart (EXIF capture time, else file time). This reliably
+catches bursts, re-saved and resized copies; it misses the same scene with a different crop or zoom.
+Indexing takes about 3–7 ms per photo, runs in the background on start, and is reused on later runs
+(recomputed only for changed files).
 
 Within a view the list stays stable while you rate, so rating through "unrated" doesn't make the cursor jump;
 press `v`/`f` again to re-apply the filter.
 
 ### Suggested workflow for a calendar
 
-1. View **unrated**, go through quickly: `x` for rejects, `3` for "maybe", `4`/`5` for good ones.
-2. View **≥ ★★★★** in grid mode (`g`), compare, promote the best to `5`, demote the rest.
-3. View **★★★★★ only** until 12–13 remain, then `imgrate export ROOT ~/calendar --min-rating 5 --flat`.
+1. Press `d` and `g`: go through the duplicate groups, `b` on the best shot of each burst.
+   Press `d` again to leave.
+2. View **unrated**, go through quickly: `x` for rejects, `3` for "maybe", `4`/`5` for good ones.
+3. View **≥ ★★★★** in grid mode (`g`), compare, promote the best to `5`, demote the rest.
+4. View **★★★★★ only**, `s` to sort by date taken, until 12–13 remain, then `imgrate export ROOT ~/calendar --min-rating 5 --flat`.
 
 ## Development
 

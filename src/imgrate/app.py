@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import math
+import os
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from typing import TYPE_CHECKING, ClassVar
@@ -14,16 +17,21 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.widgets import Footer, Label, Static
+from textual.worker import get_current_worker
 from textual_image.widget import Image as ImageWidget
 from textual_image.widget import get_cell_size
 
+from imgrate.fingerprints import Fingerprint, compute_image_signature
 from imgrate.media import scan_media_files
 from imgrate.preview import PreviewCache
 from imgrate.ratings import ALL_BUCKETS, FILTER_PRESETS, MAX_STARS, REJECTED, describe_bucket, format_stars
 from imgrate.screens import ExtensionsScreen, HelpScreen, RatingFilterScreen
+from imgrate.session import SortOrder
+from imgrate.store import RatingStore
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from textual.binding import BindingType
     from textual.timer import Timer
@@ -78,6 +86,26 @@ def format_size(size_bytes: int) -> str:
     return f"{size_value:.1f} GB"
 
 
+def shorten_home_path(path: Path) -> str:
+    home = os.path.expanduser("~")
+    path_text = str(path)
+    return "~" + path_text[len(home) :] if path_text.startswith(home) else path_text
+
+
+@dataclass(frozen=True, slots=True)
+class IndexingProgress:
+    done_count: int
+    total_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class GridPage:
+    """Visible-list index range ``[start_index, end_index)`` shown in the grid."""
+
+    start_index: int
+    end_index: int
+
+
 def build_rating_text(rating: int | None) -> Text:
     stars = format_stars(rating)
     if rating is None:
@@ -114,6 +142,9 @@ class ImageRaterApp(App[None]):
     PAGE_JUMP_SIZE = 10
     PREFETCH_AHEAD_COUNT = 3
     RESIZE_DEBOUNCE_SECONDS = 0.15
+    FINGERPRINT_WORKER_COUNT = 2
+    FINGERPRINT_BATCH_SIZE = 64
+    SORT_ORDERS: tuple[SortOrder, ...] = tuple(SortOrder)
 
     CSS = """
     Screen { layout: vertical; }
@@ -164,7 +195,10 @@ class ImageRaterApp(App[None]):
         Binding("v", "cycle_filter(1)", "View"),
         Binding("V", "cycle_filter(-1)", "View back", show=False),
         Binding("f", "choose_filter", "Filter"),
+        Binding("s", "cycle_sort", "Sort"),
         Binding("g", "toggle_grid", "Grid"),
+        Binding("d", "toggle_duplicates", "Dupes"),
+        Binding("b", "keep_best_of_group", "Best of group"),
         Binding("enter", "open_from_grid", "Open", show=False),
         Binding("e", "choose_extensions", "Formats"),
         Binding("o", "open_external", "Open ext"),
@@ -174,10 +208,11 @@ class ImageRaterApp(App[None]):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, *, session: RatingSession, database_label: str) -> None:
+    def __init__(self, *, session: RatingSession, database_path: Path) -> None:
         super().__init__()
         self._session = session
-        self._database_label = database_label
+        self._database_path = database_path
+        self._indexing_progress: IndexingProgress | None = None
         self._preview_cache = PreviewCache()
         self._is_auto_advance = True
         self._is_grid_mode = False
@@ -201,6 +236,7 @@ class ImageRaterApp(App[None]):
 
     def on_mount(self) -> None:
         self._refresh_all()
+        self._start_fingerprint_indexing()
 
     def on_unmount(self) -> None:
         self._preview_cache.shutdown()
@@ -220,6 +256,9 @@ class ImageRaterApp(App[None]):
         self._navigate(lambda: self._session.move_by(direction * step))
 
     def action_move_page(self, direction: int) -> None:
+        if self._session.is_duplicates_mode:
+            self._navigate(lambda: self._session.move_by_group(direction))
+            return
         step = self._grid_page_size if self._is_grid_mode else self.PAGE_JUMP_SIZE
         self._navigate(lambda: self._session.move_by(direction * step))
 
@@ -239,11 +278,47 @@ class ImageRaterApp(App[None]):
         self._apply_rating(None)
 
     def action_undo(self) -> None:
-        change = self._session.undo()
-        if change is None:
+        changes = self._session.undo()
+        if not changes:
             self.notify("Nothing to undo")
             return
-        self.notify(f"Undone: {change.relative_path} → {format_stars(change.previous_rating)}")
+        if len(changes) == 1:
+            self.notify(f"Undone: {changes[0].relative_path} → {format_stars(changes[0].previous_rating)}")
+        else:
+            self.notify(f"Undone: {len(changes)} rating changes")
+        self._refresh_all()
+
+    def action_cycle_sort(self) -> None:
+        if self._session.is_duplicates_mode:
+            self.notify("Duplicate groups are always ordered by time (press d to leave)")
+            return
+        sort_index = self.SORT_ORDERS.index(self._session.sort_order)
+        sort_order = self.SORT_ORDERS[(sort_index + 1) % len(self.SORT_ORDERS)]
+        self._session.set_sort_order(sort_order)
+        message = f"Sort: {sort_order.value}"
+        if sort_order is SortOrder.DATE and self._indexing_progress is not None:
+            message += " (still reading dates; unknown ones use file time)"
+        self.notify(message, timeout=2)
+        self._refresh_all()
+
+    def action_toggle_duplicates(self) -> None:
+        is_duplicates_mode = not self._session.is_duplicates_mode
+        if is_duplicates_mode:
+            self._session.rebuild_duplicate_groups()
+        self._session.set_duplicates_mode(is_duplicates_mode=is_duplicates_mode)
+        if is_duplicates_mode:
+            self.notify(self._describe_duplicates_state(), timeout=3)
+        self._refresh_all()
+
+    def action_keep_best_of_group(self) -> None:
+        if not self._session.is_duplicates_mode:
+            self.notify("Only in duplicates mode (press d)")
+            return
+        changes = self._session.reject_others_in_group()
+        if not changes:
+            return
+        self.notify(f"Kept 1, rejected {len(changes)} — z to undo", timeout=2)
+        self._session.move_by_group(1)
         self._refresh_all()
 
     def action_cycle_filter(self, direction: int) -> None:
@@ -325,6 +400,86 @@ class ImageRaterApp(App[None]):
         self._session.replace_scan(scan_result)
         self.notify(f"Found {len(scan_result.files):,} media files")
         self._refresh_all()
+        self._start_fingerprint_indexing()
+
+    # ------------------------------------------------------ fingerprint index
+
+    def _start_fingerprint_indexing(self) -> None:
+        pending_files = self._session.find_files_missing_fingerprints()
+        if not pending_files:
+            self._indexing_progress = None
+            return
+        self._indexing_progress = IndexingProgress(done_count=0, total_count=len(pending_files))
+        self.run_worker(
+            functools.partial(self._index_fingerprints, pending_files),
+            thread=True,
+            exclusive=True,
+            group="fingerprints",
+        )
+
+    def _index_fingerprints(self, pending_files: list[MediaFile]) -> None:
+        """Runs in a worker thread with its own SQLite connection."""
+        worker = get_current_worker()
+        store = RatingStore(self._database_path)
+        try:
+            with ThreadPoolExecutor(self.FINGERPRINT_WORKER_COUNT, thread_name_prefix="fingerprint") as executor:
+                signatures = executor.map(
+                    compute_image_signature, [self._session.resolve_path(media_file) for media_file in pending_files]
+                )
+                batch: list[Fingerprint] = []
+                for done_count, (media_file, signature) in enumerate(
+                    zip(pending_files, signatures, strict=True), start=1
+                ):
+                    if worker.is_cancelled:
+                        executor.shutdown(cancel_futures=True)
+                        return
+                    batch.append(
+                        Fingerprint(
+                            relative_path=media_file.relative_path,
+                            size_bytes=media_file.size_bytes,
+                            modified_timestamp_utc=media_file.modified_timestamp_utc,
+                            difference_hash=signature.difference_hash,
+                            capture_timestamp=signature.capture_timestamp,
+                        )
+                    )
+                    if len(batch) >= self.FINGERPRINT_BATCH_SIZE or done_count == len(pending_files):
+                        store.save_fingerprints(batch)
+                        self.call_from_thread(
+                            self._handle_fingerprints_computed,
+                            batch,
+                            IndexingProgress(done_count=done_count, total_count=len(pending_files)),
+                        )
+                        batch = []
+        finally:
+            store.close()
+        self.call_from_thread(self._handle_indexing_done)
+
+    def _handle_fingerprints_computed(self, fingerprints: list[Fingerprint], progress: IndexingProgress) -> None:
+        self._session.add_fingerprints(fingerprints)
+        self._indexing_progress = progress
+        self._refresh_sidebar()
+
+    def _handle_indexing_done(self) -> None:
+        self._indexing_progress = None
+        self._session.rebuild_duplicate_groups()
+        if self._session.is_duplicates_mode:
+            self.notify(self._describe_duplicates_state(), timeout=3)
+            self._refresh_all()
+        else:
+            self._refresh_sidebar()
+
+    def _describe_order(self) -> str:
+        if self._session.is_duplicates_mode:
+            return " · duplicates"
+        return f" · sort: {self._session.sort_order.value}"
+
+    def _describe_duplicates_state(self) -> str:
+        description = f"{self._session.duplicate_group_count:,} duplicate groups"
+        if self._indexing_progress is not None:
+            description += (
+                f" so far (indexed {self._indexing_progress.done_count:,} / {self._indexing_progress.total_count:,})"
+            )
+        return description
 
     # ----------------------------------------------------------------- helpers
 
@@ -369,14 +524,22 @@ class ImageRaterApp(App[None]):
         if current_file is None:
             self.query_one("#statusbar", Static).update(Text("no files in this view", style="dim"))
             return
+        group_position = self._session.current_group_position
+        position_text = (
+            f"group {group_position.group_number:,}/{group_position.group_count:,}"
+            f" · {group_position.member_number}/{group_position.member_count}"
+            if group_position is not None
+            else f"{self._session.current_index + 1:,} / {self._session.visible_count:,}"
+        )
         status_text = Text.assemble(
             build_rating_text(self._session.current_rating),
             "   ",
-            (f"{self._session.current_index + 1:,} / {self._session.visible_count:,}", "bold"),
+            (position_text, "bold"),
             "   ",
             (current_file.relative_path, ""),
             "   ",
             (f"view: {self._session.rating_filter.name}", "cyan"),
+            (self._describe_order(), "cyan"),
         )
         self.query_one("#statusbar", Static).update(status_text)
 
@@ -388,6 +551,8 @@ class ImageRaterApp(App[None]):
     def _build_info_text(self) -> Text:
         current_file = self._session.current_file
         if current_file is None:
+            if self._session.is_duplicates_mode:
+                return Text(f"No duplicate groups in this view.\n{self._describe_duplicates_state()}", style="dim")
             return Text("No files match.\nv / f: change view\ne: change formats", style="dim")
         folder, _, file_name = current_file.relative_path.rpartition("/")
         info_text = Text.assemble(
@@ -418,14 +583,22 @@ class ImageRaterApp(App[None]):
         return counts_text
 
     def _build_settings_text(self) -> Text:
+        if self._indexing_progress is not None:
+            duplicates_text = f"indexing {self._indexing_progress.done_count:,}/{self._indexing_progress.total_count:,}"
+        else:
+            duplicates_text = f"{self._session.duplicate_group_count:,} groups"
         return Text.assemble(
             ("View  ", "bold"),
             (self._session.rating_filter.name, "cyan"),
+            ("\nSort  ", "bold"),
+            "duplicate groups" if self._session.is_duplicates_mode else self._session.sort_order.value,
+            ("\nDuplicates  ", "bold"),
+            duplicates_text,
             ("\nFormats  ", "bold"),
             " ".join(sorted(self._session.enabled_extensions)) or "(none)",
             ("\nAuto-advance  ", "bold"),
             "on" if self._is_auto_advance else "off",
-            ("\n\n" + self._database_label, "dim"),
+            ("\n\ndb: " + shorten_home_path(self._database_path), "dim"),
             ("\n? for help", "dim"),
         )
 
@@ -519,13 +692,12 @@ class ImageRaterApp(App[None]):
     def _fill_grid(self) -> None:
         grid = self.query_one("#grid", Container)
         visible_files = self._session.visible_files
-        page_size = self._grid_page_size
-        page_start_index = (self._session.current_index // page_size) * page_size
+        grid_page = self._compute_grid_page()
         cell_columns = max(1, grid.content_size.width // self._grid_columns - 2)
         cell_rows = max(1, grid.content_size.height // self._grid_rows - 3)
         for cell in grid.query(ThumbnailCell):
-            file_index = page_start_index + cell.slot_index
-            media_file = visible_files[file_index] if file_index < len(visible_files) else None
+            file_index = grid_page.start_index + cell.slot_index
+            media_file = visible_files[file_index] if file_index < grid_page.end_index else None
             cell.set_class(file_index == self._session.current_index, "current")
             label = cell.query_one(".thumbnail-label", Label)
             if media_file is None:
@@ -543,6 +715,19 @@ class ImageRaterApp(App[None]):
                     ),
                     group="thumbnails",
                 )
+
+    def _compute_grid_page(self) -> GridPage:
+        """Aligned pages normally; in duplicates mode one group per page (split if it is larger)."""
+        page_size = self._grid_page_size
+        current_index = self._session.current_index
+        group_position = self._session.current_group_position
+        if group_position is None:
+            start_index = (current_index // page_size) * page_size
+            end_index = min(start_index + page_size, self._session.visible_count)
+            return GridPage(start_index=start_index, end_index=end_index)
+        group_end_index = group_position.start_index + group_position.member_count
+        start_index = group_position.start_index + (current_index - group_position.start_index) // page_size * page_size
+        return GridPage(start_index=start_index, end_index=min(start_index + page_size, group_end_index))
 
     async def _load_thumbnail(
         self, *, cell: ThumbnailCell, media_file: MediaFile, max_columns: int, max_rows: int

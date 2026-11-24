@@ -7,11 +7,25 @@ import sqlite3
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+from imgrate.fingerprints import Fingerprint
 from imgrate.ratings import MAX_STARS, REJECTED
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
+
+
+SIGNED_64_BIT_OFFSET = 1 << 64
+MAX_SIGNED_64_BIT = (1 << 63) - 1
+
+
+def to_signed_64_bit(value: int) -> int:
+    """SQLite integers are signed 64 bit; hashes are unsigned."""
+    return value - SIGNED_64_BIT_OFFSET if value > MAX_SIGNED_64_BIT else value
+
+
+def to_unsigned_64_bit(value: int) -> int:
+    return value + SIGNED_64_BIT_OFFSET if value < 0 else value
 
 
 class RatingStore:
@@ -28,6 +42,13 @@ class RatingStore:
             rating INTEGER NOT NULL CHECK (rating BETWEEN 0 AND 5),
             updated_at_utc TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS fingerprints (
+            relative_path TEXT PRIMARY KEY,
+            size_bytes INTEGER NOT NULL,
+            modified_timestamp_utc REAL NOT NULL,
+            difference_hash INTEGER,
+            capture_timestamp REAL
+        );
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -36,7 +57,8 @@ class RatingStore:
 
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
-        self._connection = sqlite3.connect(database_path)
+        # timeout: the background fingerprint indexer writes through its own connection.
+        self._connection = sqlite3.connect(database_path, timeout=10)
         self._connection.execute("PRAGMA journal_mode=WAL")
         self._connection.execute("PRAGMA synchronous=NORMAL")
         self._connection.executescript(self._SCHEMA)
@@ -80,6 +102,40 @@ class RatingStore:
         self._connection.execute(
             "INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (self._ENABLED_EXTENSIONS_KEY, json.dumps(sorted(extensions))),
+        )
+        self._connection.commit()
+
+    def load_fingerprints(self) -> dict[str, Fingerprint]:
+        rows = self._connection.execute(
+            "SELECT relative_path, size_bytes, modified_timestamp_utc, difference_hash, capture_timestamp "
+            "FROM fingerprints"
+        ).fetchall()
+        return {
+            relative_path: Fingerprint(
+                relative_path=relative_path,
+                size_bytes=size_bytes,
+                modified_timestamp_utc=modified_timestamp_utc,
+                difference_hash=None if difference_hash is None else to_unsigned_64_bit(difference_hash),
+                capture_timestamp=capture_timestamp,
+            )
+            for relative_path, size_bytes, modified_timestamp_utc, difference_hash, capture_timestamp in rows
+        }
+
+    def save_fingerprints(self, fingerprints: Iterable[Fingerprint]) -> None:
+        self._connection.executemany(
+            "INSERT OR REPLACE INTO fingerprints "
+            "(relative_path, size_bytes, modified_timestamp_utc, difference_hash, capture_timestamp) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    fingerprint.relative_path,
+                    fingerprint.size_bytes,
+                    fingerprint.modified_timestamp_utc,
+                    None if fingerprint.difference_hash is None else to_signed_64_bit(fingerprint.difference_hash),
+                    fingerprint.capture_timestamp,
+                )
+                for fingerprint in fingerprints
+            ],
         )
         self._connection.commit()
 

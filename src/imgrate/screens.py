@@ -146,15 +146,21 @@ HELP_TEXT = """\
 [b]Navigation[/b]
   → l space      next          ← h          previous
   ↓ / ↑          next / previous (grid: row down / up)
-  pgdn / pgup    jump 10 (grid: page)
+  pgdn / pgup    jump 10 (grid: page; duplicates: group)
   home / end     first / last
   n              next unrated
 
 [b]Review[/b]
   v / V          cycle rating view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected
   f              choose rating view (any combination)
+  s              cycle sort: path · rating (best first) · date taken
   g              toggle thumbnail grid
   enter          grid → open highlighted image
+
+[b]Near duplicates[/b]  (fingerprints are computed in the background, once)
+  d              toggle duplicates mode: groups of similar shots taken ≤ 15 min apart
+  b              keep this one, reject the rest of its group, go to next group
+  v / f          in duplicates mode: show groups with at least one matching member
 
 [b]Other[/b]
   e              choose file formats (e.g. exclude .mp4)
