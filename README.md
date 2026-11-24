@@ -59,7 +59,8 @@ imgrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.
 | `z` | undo |
 | `→` `l` `space` / `←` `h` | next / previous |
 | `↓` `↑` | next / previous (grid: row) |
-| `pgdn` `pgup`, `home` `end` | jump 10 (grid: page), first / last |
+| `pgdn` `pgup` | jump 10 (grid: page) |
+| `ctrl+↑` `ctrl+↓` (or `ctrl+k` `ctrl+j`, `home` `end`) | first / last |
 | `J` / `K` | next / previous section (folder, rating, month or duplicate group, depending on sort); also `]` `.` / `[` `,` |
 | `n` | next unrated |
 | `v` / `V` | cycle view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected |

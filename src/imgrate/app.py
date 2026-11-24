@@ -155,6 +155,17 @@ class ThumbnailCell(Vertical):
             yield ImageWidget(classes="thumbnail-image")
         yield Label("", classes="thumbnail-label")
 
+    def find_image_widget(self) -> ImageWidget | None:
+        """None while the cell is not (or no longer) mounted, e.g. after a page switch during fast scrolling."""
+        if not self.is_attached:
+            return None
+        return next(iter(self.query(ImageWidget)), None)
+
+    def find_label(self) -> Label | None:
+        if not self.is_attached:
+            return None
+        return next(iter(self.query(".thumbnail-label").results(Label)), None)
+
 
 class ImageRaterApp(App[None]):
     """Rate thousands of photos fast; review any rating bucket; persist everything in SQLite."""
@@ -214,8 +225,8 @@ class ImageRaterApp(App[None]):
         Binding("pageup", "move_page(-1)", "Page up", show=False),
         Binding("J,right_square_bracket,full_stop", "move_section(1)", "Section ↓", key_display="J"),
         Binding("K,left_square_bracket,comma", "move_section(-1)", "Section ↑", key_display="K"),
-        Binding("home", "move_to_start", "First", show=False),
-        Binding("end", "move_to_end", "Last", show=False),
+        Binding("home,ctrl+up,ctrl+k", "move_to_start", "First", show=False),
+        Binding("end,ctrl+down,ctrl+j", "move_to_end", "Last", show=False),
         *(
             Binding(
                 str(stars),
@@ -649,6 +660,8 @@ class ImageRaterApp(App[None]):
     # --------------------------------------------------------------- rendering
 
     def _refresh_all(self) -> None:
+        if self._find_grid() is None:
+            return
         if self._is_grid_mode:
             self._refresh_grid()
         else:
@@ -657,6 +670,8 @@ class ImageRaterApp(App[None]):
         self._refresh_statusbar()
 
     def _refresh_statusbar(self) -> None:
+        if self._find_grid() is None:
+            return
         current_file = self._session.current_file
         if current_file is None:
             self.query_one("#statusbar", Static).update(Text("no files in this view", style="dim"))
@@ -683,6 +698,8 @@ class ImageRaterApp(App[None]):
         self.query_one("#statusbar", Static).update(status_text)
 
     def _refresh_sidebar(self) -> None:
+        if self._find_grid() is None:
+            return
         self.query_one("#info", Static).update(self._build_info_text())
         self.query_one("#sections", Static).update(self._build_sections_text())
         self.query_one("#counts", Static).update(self._build_counts_text())
@@ -842,8 +859,14 @@ class ImageRaterApp(App[None]):
 
     # -------------------------------------------------------------------- grid
 
+    def _find_grid(self) -> Container | None:
+        """None during shutdown: deferred refreshes (``call_after_refresh``) can fire after the screen is gone."""
+        return next(iter(self.query("#grid").results(Container)), None)
+
     def _refresh_grid(self) -> None:
-        grid = self.query_one("#grid", Container)
+        grid = self._find_grid()
+        if grid is None:
+            return
         grid_size = grid.content_size
         if grid_size.width == 0 or grid_size.height == 0:
             self.call_after_refresh(self._refresh_grid)
@@ -871,6 +894,7 @@ class ImageRaterApp(App[None]):
         page = self._grid_pages[find_page_index(self._grid_pages, self._session.current_index)]
         if page is not self._shown_grid_page:
             self._shown_grid_page = page
+            self.workers.cancel_group(self, "thumbnails")
             grid.remove_children()
             grid.mount_all(self._build_grid_page_widgets(page, column_count=layout_key.column_count))
             self.call_after_refresh(self._fill_grid)
@@ -902,16 +926,21 @@ class ImageRaterApp(App[None]):
         )
 
     def _fill_grid(self) -> None:
-        grid = self.query_one("#grid", Container)
+        grid = self._find_grid()
+        if grid is None or self._grid_layout_key is None:
+            return
         visible_files = self._session.visible_files
         cell_columns = max(1, grid.content_size.width // max(1, self._grid_layout_key.column_count) - 2)
         cell_rows = self.THUMBNAIL_HEIGHT_CELLS - 3  # border + rating line
         for cell in grid.query(ThumbnailCell):
             if cell.file_index is None or cell.file_index >= len(visible_files):
                 continue
+            label = cell.find_label()
+            if label is None:
+                continue
             media_file = visible_files[cell.file_index]
             cell.set_class(cell.file_index == self._session.current_index, "current")
-            cell.query_one(".thumbnail-label", Label).update(build_rating_text(self._session.get_rating(media_file)))
+            label.update(build_rating_text(self._session.get_rating(media_file)))
             if cell.relative_path != media_file.relative_path:
                 cell.relative_path = media_file.relative_path
                 self.run_worker(
@@ -927,11 +956,12 @@ class ImageRaterApp(App[None]):
         preview = await self._preview_cache.get(
             self._session.resolve_path(media_file), max_edge_px=self.THUMBNAIL_EDGE_PX
         )
-        if cell.relative_path != media_file.relative_path:
+        thumbnail_widget = cell.find_image_widget()
+        label = cell.find_label()
+        if cell.relative_path != media_file.relative_path or thumbnail_widget is None or label is None:
             return
-        thumbnail_widget = cell.query_one(ImageWidget)
         if preview.image is None:
-            cell.query_one(".thumbnail-label", Label).update(Text(f"{media_file.extension} (no preview)", style="dim"))
+            label.update(Text(f"{media_file.extension} (no preview)", style="dim"))
             return
         cell_size = get_cell_size()
         cell_box = fit_image_to_cells(

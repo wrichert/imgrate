@@ -256,7 +256,7 @@ HELP_TEXT = """\
   → l space      next          ← h          previous
   ↓ / ↑          next / previous (grid: row down / up)
   pgdn / pgup    jump 10 (grid: page)
-  home / end     first / last
+  ctrl+↑ / ↓     first / last (also ctrl+k / j, home / end)
   n              next unrated
   J / K          next / previous section   (also ] . and [ ,)
 

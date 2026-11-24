@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from PIL import Image
 from textual.widgets import Input, Static
 
 from imgrate.app import ImageRaterApp, ThumbnailCell, fit_image_to_cells
@@ -185,3 +186,53 @@ async def test_c_copies_full_path_to_clipboard(session: RatingSession, monkeypat
         expected_path = str(session.resolve_path(session.current_file).resolve())
 
     assert app.clipboard == expected_path
+
+
+async def test_ctrl_arrows_and_ctrl_j_k_jump_to_last_and_first(session: RatingSession) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.press("ctrl+down")
+        index_after_ctrl_down = session.current_index
+        await pilot.press("ctrl+up")
+        index_after_ctrl_up = session.current_index
+        await pilot.press("ctrl+j")
+        index_after_ctrl_j = session.current_index
+        await pilot.press("ctrl+k")
+        index_after_ctrl_k = session.current_index
+
+    last_index = session.visible_count - 1
+    assert (index_after_ctrl_down, index_after_ctrl_up) == (last_index, 0)
+    assert (index_after_ctrl_j, index_after_ctrl_k) == (last_index, 0)
+
+
+async def test_g_toggles_grid(session: RatingSession) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.press("g")
+        await pilot.pause()
+        is_grid_after_one_toggle = app._is_grid_mode
+
+    assert is_grid_after_one_toggle is False
+
+
+async def test_fast_scrolling_through_grid_pages_does_not_crash(tmp_path: Path) -> None:
+    for photo_index in range(120):
+        Image.new("RGB", (640, 480), (photo_index * 2, 100, 200 - photo_index)).save(
+            tmp_path / f"p{photo_index:03d}.jpg"
+        )
+    store = RatingStore(tmp_path / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(tmp_path), store=store)
+    app = ImageRaterApp(session=session, database_path=tmp_path / RatingStore.DEFAULT_FILE_NAME)
+
+    async with app.run_test(size=(120, 32)) as pilot:
+        await pilot.press("ctrl+down")
+        for _ in range(4):
+            await pilot.press(*["k"] * 15)
+            await pilot.pause(0.05)
+        await pilot.press("ctrl+up")
+        await pilot.pause(0.5)
+        index_at_end = session.current_index
+
+    assert index_at_end == 0
