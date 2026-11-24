@@ -2,6 +2,24 @@
 
 Terminal UI to rate thousands of photos fast and keep only the best ones (e.g. for a year calendar).
 
+## Why
+
+A year of phone and camera photos easily means thousands of files spread over many folders, with bursts and
+near-identical shots. Picking the twelve best for a calendar (or the fifty best for a photo book) in a file browser is
+slow: you lose track of what you already looked at, and there is no place to keep the verdicts.
+
+imgrate turns this into a keyboard-only pass: one key per photo (`1`–`5` stars, `0` reject), previews right in the
+terminal, ratings saved instantly in a small database next to the photos. Afterwards you review by rating (only the
+5-star ones, only the unrated), weed out near duplicates, and export the keepers to a separate folder. Your photos
+themselves are never touched.
+
+![imgrate grid view, sorted by rating with one section per star level](docs/screenshot.png)
+
+<sub>Screenshot taken headless with generated demo images, so the thumbnails use the block-character fallback. In
+terminals with a graphics protocol (Ghostty, Kitty, WezTerm, iTerm2) they are shown at full resolution.</sub>
+
+## Features
+
 - Recursively scans a folder (hidden folders and NAS metadata like `@eaDir` are skipped)
 - Real image previews in the terminal: Kitty graphics protocol (Ghostty, Kitty, WezTerm), Sixel (iTerm2, foot, …), unicode fallback elsewhere
 - Background decoding + prefetch of the next images, JPEG draft-mode decoding (24 MP → ~25 ms), EXIF orientation, HEIC/HEIF
@@ -12,7 +30,6 @@ Terminal UI to rate thousands of photos fast and keep only the best ones (e.g. f
 - Review any rating bucket (unrated, rejected, ≥ N stars, any combination) in single view or as a thumbnail grid
 - Export from the app (`E`) or the shell, by copy or symlink, flat or with sub folders
 - Choose which file formats take part (images on by default; `.mp4`, `.mov`, RAW etc. off unless you enable them)
-- Export the keepers by copy or symlink
 
 ## Install
 
