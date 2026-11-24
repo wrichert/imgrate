@@ -239,16 +239,19 @@ async def test_fast_scrolling_through_grid_pages_does_not_crash(tmp_path: Path) 
     assert index_at_end == 0
 
 
-async def test_rating_updates_section_counts_in_sidebar_and_grid_header(session: RatingSession) -> None:
+async def test_rejecting_updates_both_section_counts_in_sidebar_and_grid_headers(session: RatingSession) -> None:
     app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
 
     async with app.run_test(size=(140, 50)) as pilot:
         await pilot.pause(0.3)
-        await pilot.press("3")
+        await pilot.press("x", "S")  # creates a "rejected" section
+        await pilot.pause(0.3)
+        await pilot.press("ctrl+up", "x")
         await pilot.pause(0.3)
         sections_text = str(app.query_one("#sections", Static).render())
         header_texts = [str(header.render()) for header in app.query(SectionHeader)]
 
-    unrated_count = session.visible_count - 1
+    unrated_count = session.visible_count - 2
     assert re.search(rf"unrated\s+{unrated_count} ↻", sections_text)
-    assert any(f"{unrated_count} files" in text and "1 re-rated" in text for text in header_texts)
+    assert re.search(r"rejected\s+2 ↻", sections_text)
+    assert any(text.startswith("rejected   2 files") and "1 in, 0 out" in text for text in header_texts)

@@ -124,23 +124,28 @@ def test_invalid_rating_is_rejected(store: RatingStore) -> None:
         store.set_rating(relative_path="a.jpg", rating=7)
 
 
-def test_rating_counts_pending_resort_until_refresh(session: RatingSession) -> None:
+def test_rating_moves_counts_between_rating_sections_until_refresh(session: RatingSession) -> None:
     session.set_sort_order(SortOrder.RATING)
-    unrated_section = session.sections[0]
-
-    session.rate(session.visible_files[0], rating=4)
-    pending_before_refresh = session.count_pending_resort(unrated_section)
+    session.rate(session.visible_files[0], rating=REJECTED)
     session.refresh_view()
-    pending_after_refresh = [session.count_pending_resort(section) for section in session.sections]
+    unrated_section, rejected_section = session.sections
 
-    assert pending_before_refresh == 1
-    assert pending_after_refresh == [0, 0]
+    session.rate(session.visible_files[0], rating=REJECTED)
+    unrated_counts = session.count_section_members(unrated_section)
+    rejected_counts = session.count_section_members(rejected_section)
+    session.refresh_view()
+    counts_after_refresh = [session.count_section_members(section) for section in session.sections]
+
+    assert (unrated_counts.member_count, unrated_counts.moved_out_count) == (unrated_section.size - 1, 1)
+    assert (rejected_counts.member_count, rejected_counts.moved_in_count) == (rejected_section.size + 1, 1)
+    assert not any(counts.is_pending_resort for counts in counts_after_refresh)
 
 
-def test_leaving_the_rating_filter_counts_as_pending_resort(session: RatingSession) -> None:
+def test_leaving_the_rating_filter_counts_as_moved_out(session: RatingSession) -> None:
     session.set_rating_filter(UNRATED_FILTER)
     folder_section = session.sections[0]
 
     session.rate(session.visible_files[0], rating=REJECTED)
+    folder_counts = session.count_section_members(folder_section)
 
-    assert session.count_pending_resort(folder_section) == 1
+    assert (folder_counts.member_count, folder_counts.moved_out_count) == (folder_section.size - 1, 1)

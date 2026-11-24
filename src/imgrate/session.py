@@ -48,6 +48,18 @@ class Section:
 
 
 @dataclass(frozen=True, slots=True)
+class SectionCounts:
+    member_count: int
+    """Files that belong to the section now, after re-ratings."""
+    moved_out_count: int
+    moved_in_count: int
+
+    @property
+    def is_pending_resort(self) -> bool:
+        return self.moved_out_count > 0 or self.moved_in_count > 0
+
+
+@dataclass(frozen=True, slots=True)
 class SectionPosition:
     """Where the cursor is (1-based numbers for display)."""
 
@@ -118,6 +130,7 @@ class RatingSession:
         self._sort_order = SortOrder.PATH
         self._visible_files: list[MediaFile] = []
         self._sections: list[Section] = []
+        self._section_counts_cache: dict[int, SectionCounts] | None = None
         self._section_starts: list[int] = []
         self._view_version = 0
         self._current_index = 0
@@ -213,17 +226,16 @@ class RatingSession:
 
     # ----------------------------------------------------------------- queries
 
-    def count_pending_resort(self, section: Section) -> int:
-        """Members re-rated since the last rebuild so that they now belong elsewhere (another rating section,
-        or outside the rating filter). They stay in place until ``refresh_view`` (S). Always 0 for duplicate groups.
+    def count_section_members(self, section: Section) -> SectionCounts:
+        """Live counts while the list is frozen: re-rated files stay in place until ``refresh_view`` (S).
+
+        A file moves out when its new rating puts it in another rating section or outside the rating filter.
+        It moves in (rating sort only) when its new rating is this section's rating. Duplicate groups never change.
+        Computed for all sections in one pass and cached until the next rating change or rebuild.
         """
-        if self._is_duplicates_mode:
-            return 0
-        return sum(
-            1
-            for media_file in self._visible_files[section.start_index : section.end_index]
-            if self._has_left_section(media_file, section=section)
-        )
+        if self._section_counts_cache is None:
+            self._section_counts_cache = self._compute_section_counts()
+        return self._section_counts_cache[section.start_index]
 
     def get_rating(self, media_file: MediaFile) -> int | None:
         return self._ratings.get(media_file.relative_path)
@@ -392,6 +404,7 @@ class RatingSession:
     # ----------------------------------------------------------------- private
 
     def _apply_rating(self, *, relative_path: str, rating: int | None) -> RatingChange:
+        self._section_counts_cache = None
         change = RatingChange(
             relative_path=relative_path, previous_rating=self._ratings.get(relative_path), new_rating=rating
         )
@@ -436,6 +449,7 @@ class RatingSession:
         sectioned_files = self._build_duplicate_view() if self._is_duplicates_mode else self._build_sorted_view()
         self._visible_files = sectioned_files.files
         self._sections = sectioned_files.sections
+        self._section_counts_cache = None
         self._section_starts = [section.start_index for section in self._sections]
         self._view_version += 1
         self._restore_cursor(anchor_file=anchor_file, previous_index=previous_index)
@@ -459,11 +473,35 @@ class RatingSession:
             files=matching_files, sections=split_into_sections(matching_files, build_label=build_label)
         )
 
-    def _has_left_section(self, media_file: MediaFile, *, section: Section) -> bool:
-        rating = self.get_rating(media_file)
-        if not self._rating_filter.matches(rating):
-            return True
-        return self._sort_order is SortOrder.RATING and describe_bucket(rating) != section.label
+    def _compute_section_counts(self) -> dict[int, SectionCounts]:
+        """Keyed by ``Section.start_index``. In path / date sort a file only moves out by leaving the rating filter
+        (its folder or month never changes); in rating sort it moves to the section labelled with its new rating."""
+        if self._is_duplicates_mode:
+            return {
+                section.start_index: SectionCounts(member_count=section.size, moved_out_count=0, moved_in_count=0)
+                for section in self._sections
+            }
+        is_rating_sort = self._sort_order is SortOrder.RATING
+        moved_out_counts: Counter[str] = Counter()
+        moved_in_counts: Counter[str] = Counter()
+        for section in self._sections:
+            for media_file in self._visible_files[section.start_index : section.end_index]:
+                rating = self.get_rating(media_file)
+                if not self._rating_filter.matches(rating):
+                    moved_out_counts[section.label] += 1
+                    continue
+                current_label = describe_bucket(rating)
+                if is_rating_sort and current_label != section.label:
+                    moved_out_counts[section.label] += 1
+                    moved_in_counts[current_label] += 1
+        return {
+            section.start_index: SectionCounts(
+                member_count=section.size - moved_out_counts[section.label] + moved_in_counts[section.label],
+                moved_out_count=moved_out_counts[section.label],
+                moved_in_count=moved_in_counts[section.label],
+            )
+            for section in self._sections
+        }
 
     def _format_rating_label(self, media_file: MediaFile) -> str:
         return describe_bucket(self.get_rating(media_file))

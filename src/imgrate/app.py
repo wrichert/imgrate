@@ -760,16 +760,19 @@ class ImageRaterApp(App[None]):
         for offset in range(window_start, window_end):
             section = sections[offset]
             label = truncate_from_left(section.label, max_length=self.SECTION_LABEL_WIDTH)
-            pending_count = self._session.count_pending_resort(section)
-            pending_marker = " ↻" if pending_count else ""
-            line = f"{label:<{self.SECTION_LABEL_WIDTH}} {section.size - pending_count:>6,}{pending_marker}"
+            section_counts = self._session.count_section_members(section)
+            pending_marker = " ↻" if section_counts.is_pending_resort else ""
+            line = f"{label:<{self.SECTION_LABEL_WIDTH}} {section_counts.member_count:>6,}{pending_marker}"
             if offset == current_offset:
                 sections_text.append(f"▶ {line}\n", style="bold reverse")
             else:
                 sections_text.append(f"  {line}\n")
         if window_end < len(sections):
             sections_text.append(f"  … {len(sections) - window_end:,} more\n", style="dim")
-        if any(self._session.count_pending_resort(section) for section in sections[window_start:window_end]):
+        if any(
+            self._session.count_section_members(section).is_pending_resort
+            for section in sections[window_start:window_end]
+        ):
             sections_text.append("  ↻ re-rated, S re-sorts\n", style="yellow")
         sections_text.rstrip()
         return sections_text
@@ -931,15 +934,18 @@ class ImageRaterApp(App[None]):
 
     def _build_section_header_text(self, row: GridRow) -> Text:
         section_number = self._session.sections.index(row.section) + 1
-        pending_count = self._session.count_pending_resort(row.section)
-        current_count = row.section.size - pending_count
+        section_counts = self._session.count_section_members(row.section)
+        member_count = section_counts.member_count
         header_text = Text.assemble(
             (row.section.label, "bold"),
-            (f"   {current_count:,} {'file' if current_count == 1 else 'files'}", ""),
+            (f"   {member_count:,} {'file' if member_count == 1 else 'files'}", ""),
             (f"   section {section_number}/{len(self._session.sections)}", "dim"),
         )
-        if pending_count:
-            header_text.append(f"   ↻ {pending_count:,} re-rated · S re-sorts", style="yellow")
+        if section_counts.is_pending_resort:
+            header_text.append(
+                f"   ↻ {section_counts.moved_in_count:,} in, {section_counts.moved_out_count:,} out · S re-sorts",
+                style="yellow",
+            )
         return header_text
 
     def _fill_grid(self) -> None:
