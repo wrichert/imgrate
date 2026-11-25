@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageStat
 
 from lazyrate.media import scan_media_files
 from lazyrate.session import RatingSession
@@ -76,3 +77,57 @@ def burst_root(tmp_path: Path) -> Path:
     root = tmp_path / "bursts"
     save_pattern_variants(root)
     return root
+
+
+class ColorEmbedder:
+    """Deterministic stand-in for CLIP: mean and spread of each colour channel (no torch, no download).
+
+    ``embed_text("white")`` points at bright, grey photos (like receipts); any other text at strongly red ones.
+    """
+
+    model_name = "test/color-statistics"
+
+    def embed_images(self, images: list[Image.Image]) -> np.ndarray:
+        rows = [self._describe(image) for image in images]
+        return np.array([row / np.linalg.norm(row) for row in rows], dtype=np.float32)
+
+    def embed_text(self, text: str) -> np.ndarray:
+        vector = np.array([1, 1, 1, 0, 0, 0] if "white" in text else [1, 0, 0, 0, 0, 0], dtype=np.float32)
+        return vector / np.linalg.norm(vector)
+
+    def _describe(self, image: Image.Image) -> np.ndarray:
+        statistics = ImageStat.Stat(image.convert("RGB"))
+        return np.array([*statistics.mean, *statistics.stddev], dtype=np.float64) / 255 + 1e-3
+
+
+JUNK_PHOTO_COUNT = 24
+KEEPER_PHOTO_COUNT = 24
+
+
+def save_junk_and_keeper_photos(root: Path) -> None:
+    """Near-white "receipts" and colourful "photos" with some variation, as training data for the junk model."""
+    rng = np.random.default_rng(seed=7)
+    for index in range(JUNK_PHOTO_COUNT):
+        gray_level = int(rng.integers(225, 255))
+        pixels = np.clip(rng.normal(gray_level, 6, size=(48, 64, 3)), 0, 255).astype(np.uint8)
+        target_path = root / "receipts" / f"r{index:02d}.jpg"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(pixels).save(target_path)
+    for index in range(KEEPER_PHOTO_COUNT):
+        base_color = rng.integers(20, 200, size=3)
+        pixels = np.clip(rng.normal(base_color, 40, size=(48, 64, 3)), 0, 255).astype(np.uint8)
+        target_path = root / "trips" / f"p{index:02d}.jpg"
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(pixels).save(target_path)
+
+
+@pytest.fixture
+def mixed_root(tmp_path: Path) -> Path:
+    root = tmp_path / "mixed"
+    save_junk_and_keeper_photos(root)
+    return root
+
+
+@pytest.fixture
+def color_embedder() -> ColorEmbedder:
+    return ColorEmbedder()

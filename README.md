@@ -31,6 +31,9 @@ terminals with a graphics protocol (Ghostty, Kitty, WezTerm, iTerm2) they are sh
 - Review any rating bucket (unrated, rejected, ≥ N stars, any combination) in single view or as a thumbnail grid
 - Export from the app (`E`) or the shell, by copy or symlink, flat or with sub folders
 - Choose which file formats take part (images on by default; `.mp4`, `.mov`, RAW etc. off unless you enable them)
+- Optional AI: suggested ratings learned from **your own** ratings (junk 0 and 1–5 stars), "rate where it learns
+  most", text search ("beach sunset"), best-of-burst hints — all local, nothing is uploaded
+- Progress bars for everything that runs in the background
 
 ## Quick start
 
@@ -38,15 +41,18 @@ Try it without cloning or installing anything (needs [uv](https://docs.astral.sh
 
 ```sh
 uvx --from git+https://github.com/wrichert/lazyrate lazyrate ~/Pictures/2025
+# with AI suggestions and search (pulls in torch, first start downloads a ~600 MB model):
+uvx --from 'lazyrate[ml] @ git+https://github.com/wrichert/lazyrate' lazyrate ~/Pictures/2025
 ```
 
 ## Install
 
 ```sh
 uv tool install git+https://github.com/wrichert/lazyrate   # then: lazyrate ~/Pictures/2025
+uv tool install 'lazyrate[ml] @ git+https://github.com/wrichert/lazyrate'   # same, with AI
 uv tool upgrade lazyrate                                    # later, to update
 # or, from a checkout
-uv sync && uv run lazyrate ~/Pictures/2025
+uv sync && uv run lazyrate ~/Pictures/2025              # add --extra ml for the AI features
 ```
 
 ## Usage
@@ -57,6 +63,9 @@ lazyrate stats ~/Pictures/2025                 # counts per rating
 lazyrate export ~/Pictures/2025 ~/calendar --min-rating 4 [--flat] [--symlink] [--dry-run]  # 4 and 5 stars
 lazyrate export ~/Pictures/2025 ~/maybe --rating 3            # exactly 3 stars (repeatable; 0 = rejected)
 lazyrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.g. read-only folder)
+lazyrate classify ~/Pictures/2025              # AI: index, learn from your ratings, report accuracy + suggestions
+lazyrate search ~/Pictures/2025 "dog in snow"  # AI: best matches for a description
+lazyrate ~/Pictures/2025 --no-ai               # TUI without AI even if installed
 ```
 
 ### Keys
@@ -87,6 +96,11 @@ lazyrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e
 | `o` | open in the system viewer (also for videos) |
 | `c` | copy the full path to the clipboard |
 | `r` | rescan folder |
+| `y` | AI: accept the suggested rating of this photo |
+| `Y` | AI: accept the suggestions of all unrated photos in the section (one undo step) |
+| `B` | AI, duplicates mode: keep the suggested best of the group, reject the rest |
+| `/` | AI: search by content; `esc` ends the search |
+| `L` | AI: retrain now (otherwise automatic every 10 ratings) |
 | `?` | help |
 
 ### Near duplicates
@@ -108,10 +122,34 @@ The app starts in the grid, sorted by rating. Within a view the list stays stabl
 doesn't make the cursor jump; press `S` to re-sort and re-filter (re-rated photos move to their new section).
 Section counts are live: a section with re-rated photos waiting for `S` is marked with ↻.
 
+### AI suggestions (optional)
+
+With the `ml` extra installed, lazyrate describes every photo once with [CLIP](https://github.com/mlfoundations/open_clip)
+(ViT-B/32, LAION-2B weights; ~400 photos/s on an Apple GPU, cached in the database, about 1 KB per photo) and learns
+from the ratings you give:
+
+- a **junk model** (rejected vs. kept): receipts, screenshots, pocket shots are a *kind* of picture, not the
+  bottom of the quality scale, so they get their own yes/no model;
+- a **star model** for 1–5 stars (ordinal: predicting 4 for a 5 is a small error, 1 for a 5 a big one).
+
+Both are small linear models (numpy, retrained in well under a second) with class balancing, so 40 five-star
+photos are not drowned by 2,000 three-star ones. Unrated photos are never used as training data. Suggestions appear
+once you have rejected 10 and starred 10 photos; star suggestions after 30 starred photos.
+
+- Unrated thumbnails show a ghost label: `★★★★? 80%`, `junk? 92%`, `keeper? 70%` (stars not learned yet).
+- `s` adds two sorts: **suggested rating** (best suggestions first, surest junk together — `Y` rejects them in one
+  go) and **most informative** (the photos the model is least sure about first: rating these teaches it the most).
+- In duplicates mode the member with the best predicted rating is marked `best?`; `B` keeps it.
+- Your ratings always win: suggestions are stored separately and nothing is rated without a key press.
+- `lazyrate stats` / `classify` report cross-validated accuracy, e.g. "within ±1 star 87%", so you can judge
+  how much to trust it. Expect junk detection to be very good and exact stars to be a matter of taste (±1).
+
 ### Suggested workflow for a calendar
 
 1. Press `d` and `g`: go through the duplicate groups, `b` on the best shot of each burst.
    Press `d` again to leave.
+   With AI: reject ~10 junk photos and star ~10 good ones, then `s` → **suggested rating**, jump to
+   **suggested junk** and check it, `Y` to reject the section.
 2. View **unrated**, go through quickly: `x` for rejects, `3` for "maybe", `4`/`5` for good ones.
 3. View **≥ ★★★★** in grid mode (`g`), compare, promote the best to `5`, demote the rest.
 4. View **★★★★★ only**, `s` to sort by date taken (one section per month), until 12–13 remain, then `E` to export.

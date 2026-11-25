@@ -1,4 +1,4 @@
-"""Modal screens: format selection, rating filter, export, help."""
+"""Modal screens: format selection, rating filter, export, search, help."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, SelectionList, Static
 from textual.widgets.selection_list import Selection
@@ -263,7 +263,8 @@ HELP_TEXT = """\
 [b]Review[/b]
   v / V          cycle rating view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected
   f              choose rating view (any combination)
-  s              cycle sort: rating (best first, default) · date taken · path — also sets the sections
+  s              cycle sort: rating (best first, default) · date taken · path
+                 (+ suggested rating · most informative once AI suggestions exist) — also sets the sections
   S              re-sort / re-filter now (re-rated files move to their new section)
   g              toggle thumbnail grid (default) / single image
   p              grid: right pane shows the highlighted image large / metadata
@@ -273,6 +274,14 @@ HELP_TEXT = """\
   d              toggle duplicates mode: groups of similar shots taken ≤ 15 min apart
   b              keep this one, reject the rest of its group, go to next group
   v / f          in duplicates mode: show groups with at least one matching member
+
+[b]AI suggestions & search[/b]  (optional "ml" install; learns from your own ratings, nothing leaves the computer)
+  y              accept the suggestion for this photo (ghost label, e.g. ★★★★? 80% or junk? 92%)
+  Y              accept the suggestions of every unrated photo in this section (one undo step)
+  B              duplicates mode: keep the suggested best of the group, reject the rest
+  /              search photos by content ("beach sunset", "receipt"); esc ends the search
+  L              retrain now (also happens automatically every 10 ratings)
+  Suggestions appear after 10 rejected + 10 starred photos; stars after 30 starred photos.
 
 [b]Other[/b]
   E              export: choose ratings, destination, flat / symlink
@@ -288,13 +297,37 @@ Export from the shell:  lazyrate export ROOT DEST --rating 5   (repeatable; or -
 """
 
 
+class SearchScreen(ModalScreen[str | None]):
+    """Text search over image content (CLIP). Returns the query; an empty query ends the search."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("escape", "cancel", "Cancel"),
+    ]
+
+    def __init__(self, *, current_query: str | None) -> None:
+        super().__init__()
+        self._current_query = current_query
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog"):
+            yield Label("Search photos by content  [dim](e.g. beach sunset · receipt · dog in snow)[/]")
+            yield Input(value=self._current_query or "", placeholder="describe the photo…", id="search-query")
+            yield Label("[dim]enter searches · empty query ends the search · esc cancels[/]")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip())
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class HelpScreen(ModalScreen[None]):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape,q,question_mark", "close", "Close"),
     ]
 
     def compose(self) -> ComposeResult:
-        with Vertical(classes="dialog help"):
+        with VerticalScroll(classes="dialog help"):
             yield Static(HELP_TEXT)
 
     def action_close(self) -> None:

@@ -19,12 +19,27 @@ if TYPE_CHECKING:
 
     from lazyrate.fingerprints import Fingerprint
     from lazyrate.store import RatingStore
+    from lazyrate.suggestions import Suggestion
 
 
 class SortOrder(StrEnum):
     PATH = "path"
     RATING = "rating"
     DATE = "date taken"
+    SUGGESTED = "suggested rating"
+    """Unrated photos by the learned suggestion (best first, junk last); needs suggestions."""
+    INFORMATIVE = "most informative"
+    """Unrated photos the model is least sure about first: rating these teaches it the most."""
+    RELEVANCE = "search"
+    """Best matches of the text search first; only while a search is active."""
+
+
+BASIC_SORT_ORDERS = (SortOrder.RATING, SortOrder.DATE, SortOrder.PATH)
+SUGGESTION_SORT_ORDERS = (SortOrder.SUGGESTED, SortOrder.INFORMATIVE)
+NO_SUGGESTION_LABEL = "no suggestion yet"
+UNCERTAINTY_BANDS = ((0.75, "very unsure"), (0.5, "unsure"), (0.25, "fairly sure"), (0.0, "sure"))
+SEARCH_RANK_BANDS = ((20, "best 20 matches"), (100, "matches 21-100"), (500, "matches 101-500"))
+OTHER_SEARCH_RESULTS_LABEL = "other photos"
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +109,42 @@ def format_month_label(timestamp: float) -> str:
     return datetime.fromtimestamp(timestamp, UTC).strftime("%B %Y")
 
 
+def describe_suggestion(suggestion: Suggestion | None) -> str:
+    """Section label of an unrated photo in the suggested-rating sort."""
+    if suggestion is None:
+        return NO_SUGGESTION_LABEL
+    if suggestion.suggested_rating is None:
+        return "suggested keeper"
+    if suggestion.suggested_rating == REJECTED:
+        return "suggested junk"
+    return f"suggested {describe_bucket(suggestion.suggested_rating)}"
+
+
+def rank_suggestion_for_sort(suggestion: Suggestion | None) -> int:
+    """Suggested ★★★★★ … ★, then keeper (stars unknown), then junk, then no suggestion."""
+    if suggestion is None:
+        return MAX_STARS + 3
+    if suggestion.suggested_rating is None:
+        return MAX_STARS + 1
+    if suggestion.suggested_rating == REJECTED:
+        return MAX_STARS + 2
+    return MAX_STARS - suggestion.suggested_rating
+
+
+def describe_uncertainty(uncertainty: float) -> str:
+    for threshold, label in UNCERTAINTY_BANDS:
+        if uncertainty >= threshold:
+            return label
+    return UNCERTAINTY_BANDS[-1][1]
+
+
+def describe_search_rank(rank: int) -> str:
+    for rank_limit, label in SEARCH_RANK_BANDS:
+        if rank < rank_limit:
+            return label
+    return OTHER_SEARCH_RESULTS_LABEL
+
+
 def rank_rating_for_sort(rating: int | None) -> int:
     """Best first: ★★★★★ … ★, then unrated, then rejected."""
     if rating is None:
@@ -132,6 +183,14 @@ class RatingSession:
         self._sections: list[Section] = []
         self._section_counts_cache: dict[int, SectionCounts] | None = None
         self._section_starts: list[int] = []
+        self._section_label_builder: Callable[[MediaFile], str] = format_folder_label
+        self._suggestions: dict[str, Suggestion] = {}
+        self._view_suggestions: dict[str, Suggestion] = {}
+        """Snapshot used for ordering and section labels, so retraining never reshuffles the list mid-rating."""
+        self._search_query: str | None = None
+        self._search_scores: dict[str, float] = {}
+        self._search_labels: dict[str, str] = {}
+        self._sort_order_before_search = SortOrder.RATING
         self._view_version = 0
         self._current_index = 0
         self._undo_stack: list[list[RatingChange]] = []
@@ -150,6 +209,11 @@ class RatingSession:
     @property
     def root(self) -> Path:
         return self._scan_result.root
+
+    @property
+    def all_files(self) -> list[MediaFile]:
+        """Every scanned file, regardless of formats, filter and sort."""
+        return self._scan_result.files
 
     @property
     def extension_counts(self) -> dict[str, int]:
@@ -178,6 +242,29 @@ class RatingSession:
     @property
     def fingerprinted_count(self) -> int:
         return len(self._fingerprints)
+
+    @property
+    def suggestion_count(self) -> int:
+        return len(self._suggestions)
+
+    @property
+    def search_query(self) -> str | None:
+        return self._search_query
+
+    @property
+    def available_sort_orders(self) -> tuple[SortOrder, ...]:
+        """What ``s`` cycles through: suggestion sorts once a model exists, search while one is active."""
+        sort_orders = BASIC_SORT_ORDERS
+        if self._suggestions:
+            sort_orders += SUGGESTION_SORT_ORDERS
+        if self._search_query is not None:
+            sort_orders += (SortOrder.RELEVANCE,)
+        return sort_orders
+
+    @property
+    def ratings(self) -> dict[str, int]:
+        """Copy of all ratings (relative path -> 0..5), e.g. as training labels."""
+        return dict(self._ratings)
 
     @property
     def visible_files(self) -> list[MediaFile]:
@@ -239,6 +326,21 @@ class RatingSession:
 
     def get_rating(self, media_file: MediaFile) -> int | None:
         return self._ratings.get(media_file.relative_path)
+
+    def get_suggestion(self, media_file: MediaFile) -> Suggestion | None:
+        """Latest suggestion (also for rated files); the UI shows it for unrated ones."""
+        return self._suggestions.get(media_file.relative_path)
+
+    def find_suggested_best_index(self, section: Section) -> int | None:
+        """Index of the member with the highest expected rating, if at least two members have suggestions."""
+        scored_indices = [
+            (suggestion.expected_stars, index)
+            for index in range(section.start_index, section.end_index)
+            if (suggestion := self._suggestions.get(self._visible_files[index].relative_path)) is not None
+        ]
+        if len(scored_indices) < 2:
+            return None
+        return max(scored_indices)[1]
 
     def resolve_path(self, media_file: MediaFile) -> Path:
         return self.root / media_file.relative_path
@@ -346,6 +448,32 @@ class RatingSession:
         self._push_undo(changes)
         return changes
 
+    def accept_suggestion_for_current(self) -> RatingChange | None:
+        """Rate the current unrated file with its suggestion; None if rated already or nothing is suggested."""
+        current_file = self.current_file
+        if current_file is None or current_file.relative_path in self._ratings:
+            return None
+        suggestion = self._suggestions.get(current_file.relative_path)
+        if suggestion is None or suggestion.suggested_rating is None:
+            return None
+        return self.rate(current_file, rating=suggestion.suggested_rating)
+
+    def accept_suggestions_in_current_section(self) -> list[RatingChange]:
+        """Rate every unrated member of the current section with its suggestion (one undo step)."""
+        section_position = self.current_section_position
+        if section_position is None:
+            return []
+        section = section_position.section
+        changes = [
+            self._apply_rating(relative_path=media_file.relative_path, rating=suggestion.suggested_rating)
+            for media_file in self._visible_files[section.start_index : section.end_index]
+            if media_file.relative_path not in self._ratings
+            and (suggestion := self._suggestions.get(media_file.relative_path)) is not None
+            and suggestion.suggested_rating is not None
+        ]
+        self._push_undo(changes)
+        return changes
+
     def undo(self) -> list[RatingChange]:
         """Revert the last rating step and move the cursor to the first affected file if it is visible."""
         if not self._undo_stack:
@@ -373,6 +501,29 @@ class RatingSession:
     def set_sort_order(self, sort_order: SortOrder) -> None:
         self._sort_order = sort_order
         self._rebuild_visible_files()
+
+    def set_suggestions(self, suggestions: dict[str, Suggestion]) -> None:
+        """Replace the suggestions; the visible order only follows on the next rebuild (S), like re-ratings."""
+        self._suggestions = dict(suggestions)
+        if not self._suggestions and self._sort_order in SUGGESTION_SORT_ORDERS:
+            self.set_sort_order(SortOrder.RATING)
+
+    def set_search(self, *, query: str, scores: dict[str, float]) -> None:
+        """Show the best matches of ``query`` first (scores: similarity per relative path)."""
+        if self._sort_order is not SortOrder.RELEVANCE:
+            self._sort_order_before_search = self._sort_order
+        self._search_query = query
+        self._search_scores = dict(scores)
+        self._sort_order = SortOrder.RELEVANCE
+        self._rebuild_visible_files()
+        self._current_index = 0
+
+    def clear_search(self) -> None:
+        if self._search_query is None:
+            return
+        self._search_query = None
+        self._search_scores = {}
+        self.set_sort_order(self._sort_order_before_search)
 
     def set_duplicates_mode(self, *, is_duplicates_mode: bool) -> None:
         self._is_duplicates_mode = is_duplicates_mode
@@ -471,6 +622,7 @@ class RatingSession:
             for media_file in self._scan_result.files
             if self._is_eligible(media_file) and self._rating_filter.matches(self.get_rating(media_file))
         ]
+        self._view_suggestions = dict(self._suggestions)
         if self._sort_order is SortOrder.RATING:
             # Stable sort: within one rating the path order of the scan is kept.
             matching_files.sort(key=lambda media_file: rank_rating_for_sort(self.get_rating(media_file)))
@@ -478,21 +630,34 @@ class RatingSession:
         elif self._sort_order is SortOrder.DATE:
             matching_files.sort(key=self._compute_sort_timestamp)
             build_label = self._format_date_label
+        elif self._sort_order is SortOrder.SUGGESTED:
+            matching_files.sort(key=self._build_suggested_sort_key)
+            build_label = self._format_suggested_label
+        elif self._sort_order is SortOrder.INFORMATIVE:
+            matching_files.sort(key=self._build_informative_sort_key)
+            build_label = self._format_informative_label
+        elif self._sort_order is SortOrder.RELEVANCE:
+            matching_files.sort(key=lambda media_file: -self._search_scores.get(media_file.relative_path, -2.0))
+            self._search_labels = {
+                media_file.relative_path: describe_search_rank(rank) for rank, media_file in enumerate(matching_files)
+            }
+            build_label = self._format_search_label
         else:
             build_label = format_folder_label
+        self._section_label_builder = build_label
         return SectionedFiles(
             files=matching_files, sections=split_into_sections(matching_files, build_label=build_label)
         )
 
     def _compute_section_counts(self) -> dict[int, SectionCounts]:
-        """Keyed by ``Section.start_index``. In path / date sort a file only moves out by leaving the rating filter
-        (its folder or month never changes); in rating sort it moves to the section labelled with its new rating."""
+        """Keyed by ``Section.start_index``. A file moves out when it leaves the rating filter or when its section
+        label changes with its rating (rating, suggested and informative sort); folders, months and search ranks
+        never change with a rating."""
         if self._is_duplicates_mode:
             return {
                 section.start_index: SectionCounts(member_count=section.size, moved_out_count=0, moved_in_count=0)
                 for section in self._sections
             }
-        is_rating_sort = self._sort_order is SortOrder.RATING
         moved_out_counts: Counter[str] = Counter()
         moved_in_counts: Counter[str] = Counter()
         for section in self._sections:
@@ -501,8 +666,8 @@ class RatingSession:
                 if not self._rating_filter.matches(rating):
                     moved_out_counts[section.label] += 1
                     continue
-                current_label = describe_bucket(rating)
-                if is_rating_sort and current_label != section.label:
+                current_label = self._section_label_builder(media_file)
+                if current_label != section.label:
                     moved_out_counts[section.label] += 1
                     moved_in_counts[current_label] += 1
         return {
@@ -516,6 +681,38 @@ class RatingSession:
 
     def _format_rating_label(self, media_file: MediaFile) -> str:
         return describe_bucket(self.get_rating(media_file))
+
+    def _format_suggested_label(self, media_file: MediaFile) -> str:
+        rating = self.get_rating(media_file)
+        if rating is not None:
+            return describe_bucket(rating)
+        return describe_suggestion(self._view_suggestions.get(media_file.relative_path))
+
+    def _build_suggested_sort_key(self, media_file: MediaFile) -> tuple[int, float]:
+        """Unrated by suggestion (best expected rating first; surest junk first), then rated photos by rating."""
+        rating = self.get_rating(media_file)
+        if rating is not None:
+            return (MAX_STARS + 4 + rank_rating_for_sort(rating), 0.0)
+        suggestion = self._view_suggestions.get(media_file.relative_path)
+        if suggestion is None:
+            return (rank_suggestion_for_sort(None), 0.0)
+        secondary_key = -suggestion.junk_probability if suggestion.is_junk else -suggestion.expected_stars
+        return (rank_suggestion_for_sort(suggestion), secondary_key)
+
+    def _format_informative_label(self, media_file: MediaFile) -> str:
+        if self.get_rating(media_file) is not None:
+            return "rated"
+        suggestion = self._view_suggestions.get(media_file.relative_path)
+        return NO_SUGGESTION_LABEL if suggestion is None else describe_uncertainty(suggestion.uncertainty)
+
+    def _build_informative_sort_key(self, media_file: MediaFile) -> tuple[int, float]:
+        if self.get_rating(media_file) is not None:
+            return (2, 0.0)
+        suggestion = self._view_suggestions.get(media_file.relative_path)
+        return (1, 0.0) if suggestion is None else (0, -suggestion.uncertainty)
+
+    def _format_search_label(self, media_file: MediaFile) -> str:
+        return self._search_labels.get(media_file.relative_path, OTHER_SEARCH_RESULTS_LABEL)
 
     def _format_date_label(self, media_file: MediaFile) -> str:
         return format_month_label(self._compute_sort_timestamp(media_file))

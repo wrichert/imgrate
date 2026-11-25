@@ -5,8 +5,12 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from lazyrate.ratings import MAX_STARS, REJECTED
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,7 +61,13 @@ def build_unique_flat_name(*, relative_path: str, used_names: set[str]) -> str:
     return candidate_name
 
 
-def export_files(*, root: Path, relative_paths: list[str], options: ExportOptions) -> ExportSummary:
+def export_files(
+    *,
+    root: Path,
+    relative_paths: list[str],
+    options: ExportOptions,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> ExportSummary:
     """Copy (or symlink) files into ``options.destination``. Existing targets are never overwritten."""
     destination = validate_destination(root=root, destination=options.destination)
     exported_count = 0
@@ -65,7 +75,9 @@ def export_files(*, root: Path, relative_paths: list[str], options: ExportOption
     missing_count = 0
     target_paths: list[Path] = []
     used_flat_names: set[str] = set()
-    for relative_path in sorted(relative_paths):
+    for done_count, relative_path in enumerate(sorted(relative_paths), start=1):
+        if on_progress is not None:
+            on_progress(done_count, len(relative_paths))
         source_path = root / relative_path
         if not source_path.is_file():
             missing_count += 1

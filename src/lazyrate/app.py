@@ -18,7 +18,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
-from textual.widgets import Footer, Label, Static
+from textual.widgets import Footer, Label, ProgressBar, Static
 from textual.worker import get_current_worker
 from textual_image.widget import Image as ImageWidget
 from textual_image.widget import get_cell_size
@@ -33,12 +33,26 @@ from lazyrate.grid_layout import (
     find_page_index,
     paginate_grid_rows,
 )
+from lazyrate.learning import (
+    build_current_embedding_matrix,
+    compute_embeddings,
+    find_files_missing_embeddings,
+    train_and_predict,
+)
 from lazyrate.media import scan_media_files
 from lazyrate.preview import PreviewCache
 from lazyrate.ratings import ALL_BUCKETS, FILTER_PRESETS, MAX_STARS, REJECTED, describe_bucket, format_stars
-from lazyrate.screens import ExportRequest, ExportScreen, ExtensionsScreen, HelpScreen, RatingFilterScreen
+from lazyrate.screens import (
+    ExportRequest,
+    ExportScreen,
+    ExtensionsScreen,
+    HelpScreen,
+    RatingFilterScreen,
+    SearchScreen,
+)
 from lazyrate.session import SortOrder
 from lazyrate.store import RatingStore
+from lazyrate.suggestions import RatingModel
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -49,10 +63,13 @@ if TYPE_CHECKING:
     from textual.timer import Timer
     from textual.widget import Widget
 
+    from lazyrate.embeddings import EmbeddingMatrix, ImageEmbedder
+    from lazyrate.learning import LearningResult
     from lazyrate.media import MediaFile, ScanResult
     from lazyrate.preview import Preview
     from lazyrate.ratings import RatingFilter
     from lazyrate.session import RatingSession
+    from lazyrate.suggestions import Suggestion
 
 
 BYTES_PER_KILOBYTE = 1024
@@ -143,6 +160,38 @@ def build_rating_text(rating: int | None) -> Text:
     return Text(stars, style="bold yellow")
 
 
+def build_suggestion_text(suggestion: Suggestion) -> Text:
+    """Ghost rating for an unrated photo, e.g. ``★★★★? 80%`` or ``junk? 92%``."""
+    confidence_text = f" {suggestion.confidence:.0%}"
+    suggested_rating = suggestion.suggested_rating
+    if suggested_rating is None:
+        return Text(f"keeper?{confidence_text}", style="italic dim")
+    if suggested_rating == REJECTED:
+        return Text(f"junk?{confidence_text}", style="italic red")
+    return Text(f"{'★' * suggested_rating}?{confidence_text}", style="italic dim yellow")
+
+
+class TaskProgressRow(Horizontal):
+    """One running background task: title plus progress bar (indeterminate while ``total`` is None)."""
+
+    def __init__(self, *, title: str, total: int | None) -> None:
+        super().__init__(classes="progress-row")
+        self._title = title
+        self._total = total
+
+    def compose(self) -> ComposeResult:
+        yield Label(self._title, classes="progress-title", markup=False)
+        yield ProgressBar(total=self._total, show_eta=True, classes="progress-bar")
+
+    def set_progress(self, *, done_count: int, total_count: int) -> None:
+        if not self.is_attached:
+            return
+        next(iter(self.query(".progress-title").results(Label))).update(
+            f"{self._title}  {done_count:,}/{total_count:,}"
+        )
+        next(iter(self.query(ProgressBar))).update(total=total_count, progress=done_count)
+
+
 class SectionHeader(Static):
     """Separator line above a section in the grid; re-rendered after every rating to keep its counts live."""
 
@@ -200,7 +249,10 @@ class ImageRaterApp(App[None]):
     RESIZE_DEBOUNCE_SECONDS = 0.15
     FINGERPRINT_WORKER_COUNT = 2
     FINGERPRINT_BATCH_SIZE = 64
-    SORT_ORDERS: tuple[SortOrder, ...] = (SortOrder.RATING, SortOrder.DATE, SortOrder.PATH)
+    RETRAIN_AFTER_RATING_COUNT = 10
+    """Retrain the suggestion model in the background after this many rating changes."""
+    PROGRESS_REPORT_STEPS = 100
+    """Threads report progress at most this many times per task (each report crosses to the UI thread)."""
 
     CSS = """
     Screen { layout: vertical; }
@@ -226,12 +278,16 @@ class ImageRaterApp(App[None]):
     #sidebar.-preview #info { height: auto; margin: 1 0 0 0; }
     #sidebar.-preview #sections, #sidebar.-preview #counts, #sidebar.-preview #settings { display: none; }
     #statusbar { height: 1; padding: 0 1; background: $panel; }
+    #progress { height: auto; background: $panel; }
+    .progress-row { height: 1; padding: 0 1; }
+    .progress-title { width: 48; color: $text-muted; }
+    .progress-bar { width: 1fr; }
     .dialog { width: 64; height: auto; max-height: 90%; padding: 1 2; background: $surface; border: thick $accent; }
     .dialog SelectionList { height: auto; max-height: 24; margin: 1 0; }
     .dialog .buttons { height: auto; align-horizontal: right; }
     .dialog Button { margin-left: 1; }
-    .help { width: 84; }
-    ExtensionsScreen, RatingFilterScreen, ExportScreen, HelpScreen { align: center middle; }
+    .help { width: 110; max-width: 96%; }
+    ExtensionsScreen, RatingFilterScreen, ExportScreen, SearchScreen, HelpScreen { align: center middle; }
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
@@ -256,7 +312,9 @@ class ImageRaterApp(App[None]):
             for stars in range(1, MAX_STARS + 1)
         ),
         Binding("0,x", f"rate({REJECTED})", "Reject"),
-        Binding("u", "clear_rating", "Unrate"),
+        Binding("y", "accept_suggestion", "Accept AI"),
+        Binding("slash", "search", "Search", key_display="/"),
+        Binding("u", "clear_rating", "Unrate", show=False),
         Binding("z", "undo", "Undo"),
         Binding("n", "next_unrated", "Next unrated"),
         Binding("v", "cycle_filter(1)", "View"),
@@ -268,7 +326,10 @@ class ImageRaterApp(App[None]):
         Binding("d", "toggle_duplicates", "Dupes"),
         Binding("b", "keep_best_of_group", "Best of group"),
         Binding("enter", "toggle_full_view", "Full view", show=False),
-        Binding("escape", "leave_full_view", "Back", show=False),
+        Binding("escape", "escape", "Back", show=False),
+        Binding("Y", "accept_section_suggestions", "Accept section", show=False),
+        Binding("B", "keep_suggested_best", "Keep AI best", show=False),
+        Binding("L", "retrain", "Retrain", show=False),
         Binding("E", "export", "Export"),
         Binding("e", "choose_extensions", "Formats"),
         Binding("o", "open_external", "Open ext"),
@@ -280,10 +341,25 @@ class ImageRaterApp(App[None]):
         Binding("q", "quit", "Quit"),
     ]
 
-    def __init__(self, *, session: RatingSession, database_path: Path) -> None:
+    def __init__(
+        self,
+        *,
+        session: RatingSession,
+        database_path: Path,
+        embedder_factory: Callable[[], ImageEmbedder] | None = None,
+    ) -> None:
+        """``embedder_factory`` enables suggestions and search; None (e.g. without ``lazyrate[ml]``) disables them."""
         super().__init__()
         self._session = session
         self._database_path = database_path
+        self._embedder_factory = embedder_factory
+        self._embedder: ImageEmbedder | None = None
+        self._embedding_matrix: EmbeddingMatrix | None = None
+        self._learning_result: LearningResult | None = None
+        self._learning_error: str | None = None
+        self._is_training = False
+        self._rating_changes_since_training = 0
+        self._progress_rows: dict[str, TaskProgressRow] = {}
         self._indexing_progress: IndexingProgress | None = None
         self._preview_cache = PreviewCache()
         self._is_auto_advance = True
@@ -310,6 +386,7 @@ class ImageRaterApp(App[None]):
                 yield Static(id="sections")
                 yield Static(id="counts")
                 yield Static(id="settings")
+        yield Vertical(id="progress")
         yield Static(id="statusbar")
         yield Footer()
 
@@ -320,6 +397,7 @@ class ImageRaterApp(App[None]):
         self._apply_view_mode()
         self._refresh_all()
         self._start_fingerprint_indexing()
+        self._start_learning_pipeline()
 
     def on_unmount(self) -> None:
         self._preview_cache.shutdown()
@@ -375,6 +453,7 @@ class ImageRaterApp(App[None]):
         if not changes:
             self.notify("Nothing to undo")
             return
+        self._note_rating_changes(len(changes))
         if len(changes) == 1:
             self.notify(
                 f"Undone: {changes[0].relative_path} → {format_stars(changes[0].previous_rating)}", markup=False
@@ -387,8 +466,9 @@ class ImageRaterApp(App[None]):
         if self._session.is_duplicates_mode:
             self.notify("Duplicate groups are always ordered by time (press d to leave)")
             return
-        sort_index = self.SORT_ORDERS.index(self._session.sort_order)
-        sort_order = self.SORT_ORDERS[(sort_index + 1) % len(self.SORT_ORDERS)]
+        sort_orders = self._session.available_sort_orders
+        sort_index = sort_orders.index(self._session.sort_order) if self._session.sort_order in sort_orders else -1
+        sort_order = sort_orders[(sort_index + 1) % len(sort_orders)]
         self._session.set_sort_order(sort_order)
         message = f"Sort: {sort_order.value}"
         if sort_order is SortOrder.DATE and self._indexing_progress is not None:
@@ -412,6 +492,7 @@ class ImageRaterApp(App[None]):
         changes = self._session.reject_others_in_group()
         if not changes:
             return
+        self._note_rating_changes(len(changes))
         self.notify(f"Kept 1, rejected {len(changes)} — z to undo", timeout=2)
         self._session.move_by_section(1)
         self._refresh_all()
@@ -467,9 +548,64 @@ class ImageRaterApp(App[None]):
         self._apply_view_mode()
         self.call_after_refresh(self._refresh_all)
 
-    def action_leave_full_view(self) -> None:
+    def action_escape(self) -> None:
+        """Leave full view first, then an active search."""
         if self._is_full_view:
             self.action_toggle_full_view()
+            return
+        if self._session.search_query is not None:
+            self._session.clear_search()
+            self.notify("Search ended", timeout=2)
+            self._refresh_all()
+
+    def action_accept_suggestion(self) -> None:
+        current_file = self._session.current_file
+        if current_file is not None and self._session.get_rating(current_file) is not None:
+            self.notify("Already rated", timeout=2)
+            return
+        if self._session.accept_suggestion_for_current() is None:
+            self.notify(self._describe_missing_suggestion(), timeout=3)
+            return
+        self._note_rating_changes(1)
+        if self._is_auto_advance:
+            self._session.move_by(1)
+        self._refresh_all()
+
+    def action_accept_section_suggestions(self) -> None:
+        changes = self._session.accept_suggestions_in_current_section()
+        if not changes:
+            self.notify("No unrated photos with suggestions in this section", timeout=3)
+            return
+        self._note_rating_changes(len(changes))
+        self.notify(f"Accepted {len(changes):,} suggestions — z to undo", timeout=3)
+        self._refresh_all()
+
+    def action_keep_suggested_best(self) -> None:
+        section_position = self._session.current_section_position
+        if not self._session.is_duplicates_mode or section_position is None:
+            self.notify("Only in duplicates mode (press d)")
+            return
+        best_index = self._session.find_suggested_best_index(section_position.section)
+        if best_index is None:
+            self.notify("No suggestions for this group yet", timeout=3)
+            return
+        self._session.move_to(best_index)
+        self.action_keep_best_of_group()
+
+    def action_search(self) -> None:
+        if self._embedder is None or self._embedding_matrix is None:
+            self.notify(self._describe_ai_unavailable(), timeout=5)
+            return
+        self.push_screen(SearchScreen(current_query=self._session.search_query), self._handle_search_query)
+
+    def action_retrain(self) -> None:
+        if self._embedding_matrix is None:
+            self.notify(self._describe_ai_unavailable(), timeout=5)
+            return
+        if self._is_training:
+            self.notify("Already learning", timeout=2)
+            return
+        self._start_training()
 
     def action_open_external(self) -> None:
         current_file = self._session.current_file
@@ -509,7 +645,7 @@ class ImageRaterApp(App[None]):
         self._refresh_sidebar()
 
     def action_rescan(self) -> None:
-        self.notify("Rescanning…")
+        self._start_progress("scan", title="Rescanning folder", total=None)
         self.run_worker(self._rescan, thread=True, exclusive=True, group="scan")
 
     def action_export(self) -> None:
@@ -536,6 +672,28 @@ class ImageRaterApp(App[None]):
 
     # ---------------------------------------------------------------- handlers
 
+    def _handle_search_query(self, query: str | None) -> None:
+        if query is None:
+            return
+        if not query:
+            self._session.clear_search()
+            self._refresh_all()
+            return
+        self._start_progress("search", title=f"Searching: {query}", total=None)
+        self.run_worker(functools.partial(self._run_search, query), thread=True, exclusive=True, group="search")
+
+    def _run_search(self, query: str) -> None:
+        if self._embedder is None or self._embedding_matrix is None:
+            return
+        scores = self._embedding_matrix.rank_by_similarity(self._embedder.embed_text(query))
+        self.call_from_thread(self._handle_search_done, query, scores)
+
+    def _handle_search_done(self, query: str, scores: dict[str, float]) -> None:
+        self._finish_progress("search")
+        self._session.set_search(query=query, scores=scores)
+        self.notify("Best matches first · esc ends the search", timeout=3)
+        self._refresh_all()
+
     def _handle_filter_chosen(self, rating_filter: RatingFilter | None) -> None:
         if rating_filter is not None:
             self._apply_filter(rating_filter)
@@ -557,7 +715,7 @@ class ImageRaterApp(App[None]):
         if not relative_paths:
             self.notify("No files with these ratings", severity="warning")
             return
-        self.notify(f"Exporting {len(relative_paths):,} files…")
+        self._start_progress("export", title=f"Exporting {len(relative_paths):,} files", total=len(relative_paths))
         self.run_worker(
             functools.partial(self._run_export, relative_paths, request.options),
             thread=True,
@@ -566,13 +724,20 @@ class ImageRaterApp(App[None]):
 
     def _run_export(self, relative_paths: list[str], options: ExportOptions) -> None:
         try:
-            summary = export_files(root=self._session.root, relative_paths=relative_paths, options=options)
+            summary = export_files(
+                root=self._session.root,
+                relative_paths=relative_paths,
+                options=options,
+                on_progress=functools.partial(self._report_progress_from_thread, "export"),
+            )
         except (OSError, ValueError) as error:
+            self.call_from_thread(self._finish_progress, "export")
             self.call_from_thread(self.notify, f"Export failed: {error}", severity="error", timeout=10, markup=False)
             return
         self.call_from_thread(self._handle_export_done, summary, options)
 
     def _handle_export_done(self, summary: ExportSummary, options: ExportOptions) -> None:
+        self._finish_progress("export")
         message = f"Exported {summary.exported_count:,} files to {shorten_home_path(options.destination)}"
         if summary.skipped_existing_count:
             message += f" ({summary.skipped_existing_count:,} already there)"
@@ -591,10 +756,12 @@ class ImageRaterApp(App[None]):
         self.call_from_thread(self._handle_rescan_done, scan_result)
 
     def _handle_rescan_done(self, scan_result: ScanResult) -> None:
+        self._finish_progress("scan")
         self._session.replace_scan(scan_result)
         self.notify(f"Found {len(scan_result.files):,} media files")
         self._refresh_all()
         self._start_fingerprint_indexing()
+        self._start_learning_pipeline()
 
     # ------------------------------------------------------ fingerprint index
 
@@ -604,6 +771,7 @@ class ImageRaterApp(App[None]):
             self._indexing_progress = None
             return
         self._indexing_progress = IndexingProgress(done_count=0, total_count=len(pending_files))
+        self._start_progress("fingerprints", title="Finding near duplicates", total=len(pending_files))
         self.run_worker(
             functools.partial(self._index_fingerprints, pending_files),
             thread=True,
@@ -651,16 +819,177 @@ class ImageRaterApp(App[None]):
     def _handle_fingerprints_computed(self, fingerprints: list[Fingerprint], progress: IndexingProgress) -> None:
         self._session.add_fingerprints(fingerprints)
         self._indexing_progress = progress
+        self._update_progress("fingerprints", done_count=progress.done_count, total_count=progress.total_count)
         self._refresh_sidebar()
 
     def _handle_indexing_done(self) -> None:
         self._indexing_progress = None
+        self._finish_progress("fingerprints")
         self._session.rebuild_duplicate_groups()
         if self._session.is_duplicates_mode:
             self.notify(self._describe_duplicates_state(), timeout=3)
             self._refresh_all()
         else:
             self._refresh_sidebar()
+
+    # ---------------------------------------------------- suggestions (AI)
+
+    def _start_learning_pipeline(self) -> None:
+        if self._embedder_factory is None:
+            return
+        self.run_worker(self._run_learning_pipeline, thread=True, exclusive=True, group="learning")
+
+    def _run_learning_pipeline(self) -> None:
+        """Worker thread: load the model once, embed new / changed photos, then hand the matrix to the UI."""
+        worker = get_current_worker()
+        embedder = self._load_embedder()
+        if embedder is None:
+            return
+        store = RatingStore(self._database_path)
+        try:
+            embeddings = store.load_embeddings(embedder.model_name)
+            pending_files = find_files_missing_embeddings(files=self._session.all_files, embeddings=embeddings)
+            if pending_files:
+                self.call_from_thread(
+                    self._start_progress, "embeddings", title="Reading image content (AI)", total=len(pending_files)
+                )
+                compute_embeddings(
+                    root=self._session.root,
+                    files=pending_files,
+                    embedder=embedder,
+                    store=store,
+                    on_progress=functools.partial(self._report_progress_from_thread, "embeddings"),
+                    should_stop=lambda: worker.is_cancelled,
+                )
+                self.call_from_thread(self._finish_progress, "embeddings")
+                embeddings = store.load_embeddings(embedder.model_name)
+        finally:
+            store.close()
+        if worker.is_cancelled:
+            return
+        embedding_matrix = build_current_embedding_matrix(files=self._session.all_files, embeddings=embeddings)
+        self.call_from_thread(self._handle_embeddings_ready, embedding_matrix)
+
+    def _load_embedder(self) -> ImageEmbedder | None:
+        """Worker thread. Loading CLIP can fail in many ways (download, torch backend), so report them all."""
+        if self._embedder is not None or self._embedder_factory is None:
+            return self._embedder
+        self.call_from_thread(
+            self._start_progress, "model", title="Loading AI model (first run downloads ~600 MB)", total=None
+        )
+        try:
+            self._embedder = self._embedder_factory()
+        except (ImportError, OSError, RuntimeError, ValueError) as error:
+            self.call_from_thread(self._handle_learning_failed, f"AI model unavailable: {error}")
+        finally:
+            self.call_from_thread(self._finish_progress, "model")
+        return self._embedder
+
+    def _handle_learning_failed(self, message: str) -> None:
+        self._learning_error = message
+        self.notify(message, severity="warning", timeout=8, markup=False)
+        self._refresh_sidebar()
+
+    def _handle_embeddings_ready(self, embedding_matrix: EmbeddingMatrix) -> None:
+        self._embedding_matrix = embedding_matrix
+        self._start_training()
+
+    def _note_rating_changes(self, change_count: int) -> None:
+        self._rating_changes_since_training += change_count
+        if self._rating_changes_since_training >= self.RETRAIN_AFTER_RATING_COUNT:
+            self._start_training()
+
+    def _start_training(self) -> None:
+        if self._embedding_matrix is None or self._is_training:
+            return
+        self._is_training = True
+        self._rating_changes_since_training = 0
+        self._start_progress("training", title="Learning from your ratings", total=None)
+        self.run_worker(
+            functools.partial(self._train, self._embedding_matrix, self._session.ratings),
+            thread=True,
+            group="training",
+        )
+
+    def _train(self, embedding_matrix: EmbeddingMatrix, ratings: dict[str, int]) -> None:
+        self.call_from_thread(
+            self._handle_learning_result, train_and_predict(embedding_matrix=embedding_matrix, ratings=ratings)
+        )
+
+    def _handle_learning_result(self, result: LearningResult) -> None:
+        self._is_training = False
+        self._finish_progress("training")
+        had_suggestions = self._session.suggestion_count > 0
+        self._learning_result = result
+        self._session.set_suggestions(result.suggestions)
+        if result.suggestions and not had_suggestions:
+            self.notify("AI suggestions ready: s → sort 'suggested rating', y accepts, Y accepts a section", timeout=8)
+        self._refresh_all()
+        if self._rating_changes_since_training >= self.RETRAIN_AFTER_RATING_COUNT:
+            self._start_training()
+
+    def _describe_ai_unavailable(self) -> str:
+        if self._embedder_factory is None:
+            return "AI features are off (install with: uv tool install 'lazyrate[ml]' …)"
+        if self._learning_error is not None:
+            return self._learning_error
+        return "AI is still reading the photos — see the progress bar"
+
+    def _describe_missing_suggestion(self) -> str:
+        if self._learning_result is None:
+            return self._describe_ai_unavailable()
+        if not self._learning_result.readiness.is_junk_model_ready:
+            return "Not enough ratings yet to suggest (see AI in the sidebar)"
+        return "No star suggestion yet for this photo (needs more starred photos)"
+
+    def _describe_ai_state(self) -> str:
+        if self._embedder_factory is None:
+            return "off"
+        if self._learning_error is not None:
+            return "unavailable"
+        result = self._learning_result
+        if result is None:
+            return "reading photos…"
+        readiness = result.readiness
+        if not readiness.is_junk_model_ready:
+            missing_rejected = readiness.missing_rejected_count
+            missing_starred = max(0, RatingModel.MIN_EXAMPLES_PER_SIDE - readiness.starred_count)
+            return f"learning: rate {missing_rejected} more rejects, {missing_starred} more starred"
+        stars_state = (
+            "stars ✓" if readiness.is_star_model_ready else f"stars: {readiness.missing_starred_count} more starred"
+        )
+        state = f"junk ✓ · {stars_state}"
+        evaluation = result.evaluation
+        if evaluation is not None and evaluation.star_within_one_accuracy is not None:
+            state += f" · ±1★ {evaluation.star_within_one_accuracy:.0%}"
+        return state
+
+    # ----------------------------------------------------------- progress panel
+
+    def _start_progress(self, task_key: str, *, title: str, total: int | None) -> None:
+        self._finish_progress(task_key)
+        progress_panel = next(iter(self.query("#progress")), None)
+        if progress_panel is None:
+            return
+        progress_row = TaskProgressRow(title=title, total=total)
+        self._progress_rows[task_key] = progress_row
+        progress_panel.mount(progress_row)
+
+    def _update_progress(self, task_key: str, *, done_count: int, total_count: int) -> None:
+        progress_row = self._progress_rows.get(task_key)
+        if progress_row is not None:
+            progress_row.set_progress(done_count=done_count, total_count=total_count)
+
+    def _finish_progress(self, task_key: str) -> None:
+        progress_row = self._progress_rows.pop(task_key, None)
+        if progress_row is not None and progress_row.is_attached:
+            progress_row.remove()
+
+    def _report_progress_from_thread(self, task_key: str, done_count: int, total_count: int) -> None:
+        """Worker threads: forward progress to the UI, throttled to about PROGRESS_REPORT_STEPS updates per task."""
+        report_step = max(1, total_count // self.PROGRESS_REPORT_STEPS)
+        if done_count % report_step == 0 or done_count == total_count:
+            self.call_from_thread(self._update_progress, task_key, done_count=done_count, total_count=total_count)
 
     def _describe_order(self) -> str:
         if self._session.is_duplicates_mode:
@@ -707,6 +1036,7 @@ class ImageRaterApp(App[None]):
     def _apply_rating(self, rating: int | None) -> None:
         if self._session.rate_current(rating) is None:
             return
+        self._note_rating_changes(1)
         if self._is_auto_advance and rating is not None:
             self._session.move_by(1)
         self._refresh_all()
@@ -746,6 +1076,7 @@ class ImageRaterApp(App[None]):
         )
         status_text = Text.assemble(
             build_rating_text(self._session.current_rating),
+            self._build_suggestion_hint(current_file),
             "   ",
             (f"{self._session.current_index + 1:,} / {self._session.visible_count:,}", "bold"),
             "   ",
@@ -779,8 +1110,11 @@ class ImageRaterApp(App[None]):
             (folder or ".", "dim"),
             "\n\n",
             build_rating_text(self._session.current_rating),
+            self._build_suggestion_hint(current_file),
             "\n",
         )
+        if self._is_suggested_best_of_group(self._session.current_index):
+            info_text.append("suggested best of this group (B keeps it)\n", style="green")
         preview = self._current_preview
         if preview is not None and preview.original_width_px is not None:
             info_text.append(f"{preview.original_width_px}×{preview.original_height_px} · ")  # noqa: RUF001
@@ -854,9 +1188,38 @@ class ImageRaterApp(App[None]):
             " ".join(sorted(self._session.enabled_extensions)) or "(none)",
             ("\nAuto-advance  ", "bold"),
             "on" if self._is_auto_advance else "off",
+            ("\nAI  ", "bold"),
+            self._describe_ai_state(),
+            ("" if self._session.search_query is None else "\nSearch  "),
+            ("" if self._session.search_query is None else self._session.search_query, "cyan"),
             ("\n\ndb: " + shorten_home_path(self._database_path), "dim"),
             ("\n? for help", "dim"),
         )
+
+    def _build_suggestion_hint(self, media_file: MediaFile) -> Text:
+        """``  suggested ★★★★? 80%`` for unrated photos with a suggestion, else empty."""
+        suggestion = self._session.get_suggestion(media_file)
+        if suggestion is None or self._session.get_rating(media_file) is not None:
+            return Text("")
+        return Text.assemble(("  suggested ", "dim"), build_suggestion_text(suggestion))
+
+    def _is_suggested_best_of_group(self, file_index: int) -> bool:
+        section_position = self._session.current_section_position
+        if not self._session.is_duplicates_mode or section_position is None:
+            return False
+        return self._session.find_suggested_best_index(section_position.section) == file_index
+
+    def _build_thumbnail_label(self, media_file: MediaFile, *, is_suggested_best: bool) -> Text:
+        rating = self._session.get_rating(media_file)
+        suggestion = self._session.get_suggestion(media_file)
+        label_text = (
+            build_suggestion_text(suggestion)
+            if rating is None and suggestion is not None
+            else build_rating_text(rating)
+        )
+        if is_suggested_best:
+            label_text.append(" · best?", style="green")
+        return label_text
 
     def _compute_preview_edge_px(self, container_size: Size) -> int:
         """Decode size for a preview filling ``container_size`` (cells), rounded so the cache can reuse it."""
@@ -1038,6 +1401,7 @@ class ImageRaterApp(App[None]):
         cell_rows = self.THUMBNAIL_HEIGHT_CELLS - 3  # border + rating line
         for header in grid.query(SectionHeader):
             header.update(self._build_section_header_text(header.row))
+        suggested_best_indices = self._find_suggested_best_indices_on_page()
         for cell in grid.query(ThumbnailCell):
             if cell.file_index is None or cell.file_index >= len(visible_files):
                 continue
@@ -1046,7 +1410,9 @@ class ImageRaterApp(App[None]):
                 continue
             media_file = visible_files[cell.file_index]
             cell.set_class(cell.file_index == self._session.current_index, "current")
-            label.update(build_rating_text(self._session.get_rating(media_file)))
+            label.update(
+                self._build_thumbnail_label(media_file, is_suggested_best=cell.file_index in suggested_best_indices)
+            )
             if cell.relative_path != media_file.relative_path:
                 cell.relative_path = media_file.relative_path
                 self.run_worker(
@@ -1055,6 +1421,16 @@ class ImageRaterApp(App[None]):
                     ),
                     group="thumbnails",
                 )
+
+    def _find_suggested_best_indices_on_page(self) -> set[int]:
+        if not self._session.is_duplicates_mode or self._shown_grid_page is None:
+            return set()
+        page_sections = {row.section for row in self._shown_grid_page.rows}
+        return {
+            best_index
+            for section in page_sections
+            if (best_index := self._session.find_suggested_best_index(section)) is not None
+        }
 
     async def _load_thumbnail(
         self, *, cell: ThumbnailCell, media_file: MediaFile, max_columns: int, max_rows: int

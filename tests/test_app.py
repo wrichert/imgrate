@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     import pytest
+    from conftest import ColorEmbedder
+    from textual.pilot import Pilot
 
 
 def test_fit_image_to_cells_keeps_aspect_ratio() -> None:
@@ -348,3 +350,125 @@ async def test_enter_opens_full_view_and_returns_to_previous_view(session: Ratin
     assert is_back_in_grid
     assert is_full_view_from_single
     assert is_back_in_single_view
+
+
+def build_mixed_session(root: Path) -> RatingSession:
+    """Half of the receipts rejected and half of the trips starred, so the junk model can train."""
+    store = RatingStore(root / RatingStore.DEFAULT_FILE_NAME)
+    for index in range(12):
+        store.set_rating(relative_path=f"receipts/r{index:02d}.jpg", rating=REJECTED)
+        store.set_rating(relative_path=f"trips/p{index:02d}.jpg", rating=3 + index % 3)
+    return RatingSession(scan_result=scan_media_files(root), store=store)
+
+
+async def wait_for_suggestions(app: ImageRaterApp, pilot: Pilot[None], session: RatingSession) -> None:
+    for _ in range(100):
+        await pilot.pause(0.05)
+        if session.suggestion_count and not app.query(".progress-row"):
+            return
+    raise AssertionError("no suggestions after 5 s")
+
+
+async def test_background_learning_suggests_junk_and_hides_progress_when_done(
+    mixed_root: Path, color_embedder: ColorEmbedder
+) -> None:
+    session = build_mixed_session(mixed_root)
+    app = ImageRaterApp(
+        session=session,
+        database_path=mixed_root / RatingStore.DEFAULT_FILE_NAME,
+        embedder_factory=lambda: color_embedder,
+    )
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_suggestions(app, pilot, session)
+        receipt_label = str(
+            app._build_thumbnail_label(
+                next(file for file in session.all_files if file.relative_path == "receipts/r20.jpg"),
+                is_suggested_best=False,
+            )
+        )
+        settings_text = str(app.query_one("#settings", Static).render())
+
+    assert receipt_label.startswith("junk?")
+    assert "junk ✓" in settings_text
+
+
+async def test_y_accepts_and_capital_y_accepts_the_section(mixed_root: Path, color_embedder: ColorEmbedder) -> None:
+    session = build_mixed_session(mixed_root)
+    app = ImageRaterApp(
+        session=session,
+        database_path=mixed_root / RatingStore.DEFAULT_FILE_NAME,
+        embedder_factory=lambda: color_embedder,
+    )
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_suggestions(app, pilot, session)
+        session.set_sort_order(SortOrder.SUGGESTED)
+        junk_section = next(section for section in session.sections if section.label == "suggested junk")
+        session.move_to(junk_section.start_index)
+        await pilot.press("y")
+        await pilot.press("Y")
+        await pilot.pause()
+
+    receipt_ratings = [rating for path, rating in session.ratings.items() if path.startswith("receipts/")]
+    assert receipt_ratings == [REJECTED] * 24
+
+
+async def test_slash_searches_by_content_and_escape_ends_it(mixed_root: Path, color_embedder: ColorEmbedder) -> None:
+    session = build_mixed_session(mixed_root)
+    app = ImageRaterApp(
+        session=session,
+        database_path=mixed_root / RatingStore.DEFAULT_FILE_NAME,
+        embedder_factory=lambda: color_embedder,
+    )
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_suggestions(app, pilot, session)
+        await pilot.press("slash", *"white", "enter")
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if session.search_query is not None:
+                break
+        first_match = session.visible_files[0].relative_path
+        await pilot.press("escape")
+        query_after_escape = session.search_query
+
+    assert first_match.startswith("receipts/")
+    assert query_after_escape is None
+
+
+async def test_ten_new_ratings_retrain_the_model(mixed_root: Path, color_embedder: ColorEmbedder) -> None:
+    session = build_mixed_session(mixed_root)
+    app = ImageRaterApp(
+        session=session,
+        database_path=mixed_root / RatingStore.DEFAULT_FILE_NAME,
+        embedder_factory=lambda: color_embedder,
+    )
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_suggestions(app, pilot, session)
+        session.set_sort_order(SortOrder.PATH)
+        session.move_to(
+            next(index for index, file in enumerate(session.visible_files) if file.relative_path == "receipts/r12.jpg")
+        )
+        await pilot.press(*["x"] * ImageRaterApp.RETRAIN_AFTER_RATING_COUNT)
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if app._learning_result is not None and app._learning_result.readiness.rejected_count > 12:
+                break
+        rejected_count = app._learning_result.readiness.rejected_count if app._learning_result else 0
+
+    assert rejected_count == 12 + ImageRaterApp.RETRAIN_AFTER_RATING_COUNT
+
+
+async def test_without_ai_the_search_key_explains_how_to_enable_it(session: RatingSession) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.press("slash")
+        await pilot.pause()
+        screen_name = type(app.screen).__name__
+        settings_text = str(app.query_one("#settings", Static).render())
+
+    assert screen_name != "SearchScreen"
+    assert "AI  off" in settings_text

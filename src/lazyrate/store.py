@@ -7,6 +7,9 @@ import sqlite3
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
+import numpy as np
+
+from lazyrate.embeddings import StoredEmbedding
 from lazyrate.fingerprints import Fingerprint
 from lazyrate.ratings import MAX_STARS, REJECTED
 
@@ -72,6 +75,14 @@ class RatingStore:
             modified_timestamp_utc REAL NOT NULL,
             difference_hash INTEGER,
             capture_timestamp REAL
+        );
+        CREATE TABLE IF NOT EXISTS embeddings (
+            relative_path TEXT NOT NULL,
+            model_name TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            modified_timestamp_utc REAL NOT NULL,
+            vector BLOB NOT NULL,
+            PRIMARY KEY (relative_path, model_name)
         );
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -159,6 +170,40 @@ class RatingStore:
                     fingerprint.capture_timestamp,
                 )
                 for fingerprint in fingerprints
+            ],
+        )
+        self._connection.commit()
+
+    def load_embeddings(self, model_name: str) -> dict[str, StoredEmbedding]:
+        rows = self._connection.execute(
+            "SELECT relative_path, size_bytes, modified_timestamp_utc, vector FROM embeddings WHERE model_name = ?",
+            (model_name,),
+        ).fetchall()
+        return {
+            relative_path: StoredEmbedding(
+                relative_path=relative_path,
+                size_bytes=size_bytes,
+                modified_timestamp_utc=modified_timestamp_utc,
+                model_name=model_name,
+                vector=np.frombuffer(vector, dtype=np.float16).astype(np.float32),
+            )
+            for relative_path, size_bytes, modified_timestamp_utc, vector in rows
+        }
+
+    def save_embeddings(self, embeddings: Iterable[StoredEmbedding]) -> None:
+        """Vectors are stored as float16 (1 KB for 512 dimensions); plenty for cosine similarity and linear models."""
+        self._connection.executemany(
+            "INSERT OR REPLACE INTO embeddings "
+            "(relative_path, model_name, size_bytes, modified_timestamp_utc, vector) VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    embedding.relative_path,
+                    embedding.model_name,
+                    embedding.size_bytes,
+                    embedding.modified_timestamp_utc,
+                    embedding.vector.astype(np.float16).tobytes(),
+                )
+                for embedding in embeddings
             ],
         )
         self._connection.commit()
