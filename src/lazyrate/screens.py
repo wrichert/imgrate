@@ -221,7 +221,7 @@ class ExportScreen(ModalScreen[ExportRequest | None]):
         try:
             destination = validate_destination(root=self._root, destination=Path(destination_text))
         except ValueError as error:
-            self.notify(str(error), severity="error")
+            self.notify(str(error), severity="error", markup=False)
             return
         self.dismiss(
             ExportRequest(
@@ -258,7 +258,7 @@ HELP_TEXT = """\
   pgdn / pgup    jump 10 (grid: page)
   ctrl+↑ / ↓     first / last (also ctrl+k / j, home / end)
   n              next unrated
-  J / K          next / previous section   (also ] . and [ ,)
+  J / K          next / previous section   (also ] . and \\[ ,)
 
 [b]Review[/b]
   v / V          cycle rating view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected

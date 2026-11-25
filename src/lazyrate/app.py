@@ -374,7 +374,9 @@ class ImageRaterApp(App[None]):
             self.notify("Nothing to undo")
             return
         if len(changes) == 1:
-            self.notify(f"Undone: {changes[0].relative_path} → {format_stars(changes[0].previous_rating)}")
+            self.notify(
+                f"Undone: {changes[0].relative_path} → {format_stars(changes[0].previous_rating)}", markup=False
+            )
         else:
             self.notify(f"Undone: {len(changes)} rating changes")
         self._refresh_all()
@@ -472,7 +474,7 @@ class ImageRaterApp(App[None]):
                 stderr=subprocess.DEVNULL,
             )
         except OSError as error:
-            self.notify(f"Cannot open: {error}", severity="error")
+            self.notify(f"Cannot open: {error}", severity="error", markup=False)
 
     def action_copy_path(self) -> None:
         """Copy the absolute path via the system clipboard tool; OSC 52 (terminal clipboard) as a fallback."""
@@ -490,7 +492,7 @@ class ImageRaterApp(App[None]):
                 is_copied = False
         if not is_copied:
             self.copy_to_clipboard(full_path)
-        self.notify(f"Copied {full_path}", timeout=3)
+        self.notify(f"Copied {full_path}", timeout=3, markup=False)
 
     def action_toggle_auto_advance(self) -> None:
         self._is_auto_advance = not self._is_auto_advance
@@ -557,7 +559,7 @@ class ImageRaterApp(App[None]):
         try:
             summary = export_files(root=self._session.root, relative_paths=relative_paths, options=options)
         except (OSError, ValueError) as error:
-            self.call_from_thread(self.notify, f"Export failed: {error}", severity="error", timeout=10)
+            self.call_from_thread(self.notify, f"Export failed: {error}", severity="error", timeout=10, markup=False)
             return
         self.call_from_thread(self._handle_export_done, summary, options)
 
@@ -567,7 +569,7 @@ class ImageRaterApp(App[None]):
             message += f" ({summary.skipped_existing_count:,} already there)"
         if summary.missing_count:
             message += f" ({summary.missing_count:,} missing on disk)"
-        self.notify(message, timeout=8)
+        self.notify(message, timeout=8, markup=False)
 
     def _handle_extensions_chosen(self, extensions: set[str] | None) -> None:
         if extensions is None:
@@ -906,7 +908,7 @@ class ImageRaterApp(App[None]):
             preview_widget.image = None
             preview_widget.display = False
             placeholder.display = True
-            placeholder.update(preview.error or "no preview")
+            placeholder.update(Text(preview.error or "no preview"))
             return
         viewer_size = self.query_one("#viewer").content_size
         cell_size = get_cell_size()

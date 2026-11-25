@@ -4,12 +4,13 @@ import re
 from typing import TYPE_CHECKING
 
 from PIL import Image
+from textual.content import Content
 from textual.widgets import Input, Static
 
 from lazyrate.app import ImageRaterApp, SectionHeader, ThumbnailCell, fit_image_to_cells
 from lazyrate.media import scan_media_files
 from lazyrate.ratings import REJECTED
-from lazyrate.screens import ExportScreen
+from lazyrate.screens import HELP_TEXT, ExportScreen
 from lazyrate.session import RatingSession, SortOrder
 from lazyrate.store import RatingStore
 
@@ -288,3 +289,39 @@ async def test_p_switches_right_pane_to_large_preview_and_is_remembered(
     assert is_sections_hidden
     assert not is_preview_pane_in_single_view
     assert store.load_setting(ImageRaterApp.SIDE_PANE_SETTING_KEY) == ImageRaterApp.SIDE_PANE_PREVIEW
+
+
+def test_help_text_is_valid_markup() -> None:
+    content = Content.from_markup(HELP_TEXT)
+
+    assert "(also ] . and [ ,)" in content.plain
+
+
+async def test_question_mark_opens_help(session: RatingSession) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 50)) as pilot:
+        await pilot.press("question_mark")
+        await pilot.pause()
+        screen_name = type(app.screen).__name__
+
+    assert screen_name == "HelpScreen"
+
+
+async def test_copying_a_path_with_brackets_does_not_break_markup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("lazyrate.app.shutil.which", lambda _command: None)  # no clipboard tool -> OSC 52 fallback
+    photo_folder = tmp_path / "[2024] summer"
+    photo_folder.mkdir()
+    Image.new("RGB", (64, 48), (200, 120, 40)).save(photo_folder / "[b]beach.jpg")
+    store = RatingStore(tmp_path / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(tmp_path), store=store)
+    app = ImageRaterApp(session=session, database_path=tmp_path / RatingStore.DEFAULT_FILE_NAME)
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.press("c", "3", "z")
+        await pilot.pause(0.3)
+        copied_path = app.clipboard
+
+    assert copied_path.endswith("[2024] summer/[b]beach.jpg")
