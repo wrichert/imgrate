@@ -267,3 +267,24 @@ async def test_starts_on_first_unrated_file(session: RatingSession) -> None:
 
     assert current_rating is None
     assert current_index == 1  # rating sort: the 4-star file first, then the unrated ones
+
+
+async def test_p_switches_right_pane_to_large_preview_and_is_remembered(
+    session: RatingSession, store: RatingStore
+) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.pause(0.3)
+        await pilot.press("p")
+        await pilot.pause(0.5)
+        is_preview_pane = app.query_one("#sidebar").has_class("-preview")
+        is_image_loaded = app.query_one("#side-preview-image").image is not None
+        is_sections_hidden = not app.query_one("#sections").display or not app.query_one("#sections").visible
+        await pilot.press("g")
+        is_preview_pane_in_single_view = app.query_one("#sidebar").has_class("-preview")
+
+    assert is_preview_pane and is_image_loaded
+    assert is_sections_hidden
+    assert not is_preview_pane_in_single_view
+    assert store.load_setting(ImageRaterApp.SIDE_PANE_SETTING_KEY) == ImageRaterApp.SIDE_PANE_PREVIEW

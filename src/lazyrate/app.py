@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from textual.binding import BindingType
+    from textual.geometry import Size
     from textual.timer import Timer
     from textual.widget import Widget
 
@@ -181,6 +182,9 @@ class ImageRaterApp(App[None]):
     TITLE = "lazyrate"
     DEFAULT_SORT_ORDER = SortOrder.RATING
     EXPORT_OPTIONS_SETTING_KEY = "export_options"
+    SIDE_PANE_SETTING_KEY = "side_pane"
+    SIDE_PANE_PREVIEW = "preview"
+    SIDE_PANE_INFO = "info"
     SECTION_LIST_MAX_LINES = 9
     SECTION_LABEL_WIDTH = 20
     PREVIEW_EDGE_STEP_PX = 256
@@ -215,6 +219,12 @@ class ImageRaterApp(App[None]):
     .thumbnail-label { width: 100%; height: 1; content-align: center middle; }
     #sidebar { width: 34; border-left: vkey $panel; padding: 0 1; }
     #sidebar Static { margin-bottom: 1; }
+    #side-preview { height: 1fr; align: center middle; display: none; }
+    #side-preview-image { width: auto; height: auto; }
+    #sidebar.-preview { width: 50%; }
+    #sidebar.-preview #side-preview { display: block; }
+    #sidebar.-preview #info { height: auto; margin: 1 0 0 0; }
+    #sidebar.-preview #sections, #sidebar.-preview #counts, #sidebar.-preview #settings { display: none; }
     #statusbar { height: 1; padding: 0 1; background: $panel; }
     .dialog { width: 64; height: auto; max-height: 90%; padding: 1 2; background: $surface; border: thick $accent; }
     .dialog SelectionList { height: auto; max-height: 24; margin: 1 0; }
@@ -262,6 +272,7 @@ class ImageRaterApp(App[None]):
         Binding("e", "choose_extensions", "Formats"),
         Binding("o", "open_external", "Open ext"),
         Binding("c", "copy_path", "Copy path"),
+        Binding("p", "toggle_side_preview", "Big preview"),
         Binding("a", "toggle_auto_advance", "Auto-adv", show=False),
         Binding("r", "rescan", "Rescan", show=False),
         Binding("question_mark", "help", "Help"),
@@ -276,6 +287,7 @@ class ImageRaterApp(App[None]):
         self._preview_cache = PreviewCache()
         self._is_auto_advance = True
         self._is_grid_mode = True
+        self._is_side_preview_enabled = False
         self._grid_layout_key: GridLayoutKey | None = None
         self._grid_rows: list[GridRow] = []
         self._grid_pages: list[GridPage] = []
@@ -290,6 +302,8 @@ class ImageRaterApp(App[None]):
                 yield Static("", id="placeholder")
             yield Container(id="grid")
             with Vertical(id="sidebar"):
+                with Container(id="side-preview"):
+                    yield ImageWidget(id="side-preview-image")
                 yield Static(id="info")
                 yield Static(id="sections")
                 yield Static(id="counts")
@@ -300,6 +314,7 @@ class ImageRaterApp(App[None]):
     def on_mount(self) -> None:
         self._session.set_sort_order(self.DEFAULT_SORT_ORDER)
         self._session.move_to_first_unrated()
+        self._is_side_preview_enabled = self._session.load_setting(self.SIDE_PANE_SETTING_KEY) == self.SIDE_PANE_PREVIEW
         self._apply_view_mode()
         self._refresh_all()
         self._start_fingerprint_indexing()
@@ -419,6 +434,17 @@ class ImageRaterApp(App[None]):
             ),
             self._handle_extensions_chosen,
         )
+
+    def action_toggle_side_preview(self) -> None:
+        self._is_side_preview_enabled = not self._is_side_preview_enabled
+        self._session.save_setting(
+            key=self.SIDE_PANE_SETTING_KEY,
+            value=self.SIDE_PANE_PREVIEW if self._is_side_preview_enabled else self.SIDE_PANE_INFO,
+        )
+        if self._is_side_preview_enabled and not self._is_grid_mode:
+            self.notify("The large preview in the right pane is shown in grid view (g)", timeout=3)
+        self._apply_view_mode()
+        self.call_after_refresh(self._refresh_all)
 
     def action_toggle_grid(self) -> None:
         self._is_grid_mode = not self._is_grid_mode
@@ -640,9 +666,15 @@ class ImageRaterApp(App[None]):
 
     # ----------------------------------------------------------------- helpers
 
+    @property
+    def _is_side_preview_shown(self) -> bool:
+        """In single view the main area already shows the image large, so the pane keeps the metadata."""
+        return self._is_side_preview_enabled and self._is_grid_mode
+
     def _apply_view_mode(self) -> None:
         self.query_one("#viewer").display = not self._is_grid_mode
         self.query_one("#grid").display = self._is_grid_mode
+        self.query_one("#sidebar").set_class(self._is_side_preview_shown, "-preview")
 
     def _move_to_next_unrated(self) -> None:
         if not self._session.move_to_next_unrated():
@@ -675,6 +707,8 @@ class ImageRaterApp(App[None]):
             self._refresh_grid()
         else:
             self.run_worker(self._show_current_preview(), exclusive=True, group="preview")
+        if self._is_side_preview_shown:
+            self.run_worker(self._show_side_preview(), exclusive=True, group="side-preview")
         self._refresh_sidebar()
         self._refresh_statusbar()
 
@@ -806,10 +840,10 @@ class ImageRaterApp(App[None]):
             ("\n? for help", "dim"),
         )
 
-    def _compute_preview_edge_px(self) -> int:
-        viewer_size = self.query_one("#viewer").content_size
+    def _compute_preview_edge_px(self, container_size: Size) -> int:
+        """Decode size for a preview filling ``container_size`` (cells), rounded so the cache can reuse it."""
         cell_size = get_cell_size()
-        longest_edge_px = max(viewer_size.width * cell_size.width, viewer_size.height * cell_size.height)
+        longest_edge_px = max(container_size.width * cell_size.width, container_size.height * cell_size.height)
         rounded_edge_px = math.ceil(longest_edge_px / self.PREVIEW_EDGE_STEP_PX) * self.PREVIEW_EDGE_STEP_PX
         return max(self.PREVIEW_MIN_EDGE_PX, min(self.PREVIEW_MAX_EDGE_PX, rounded_edge_px))
 
@@ -825,7 +859,7 @@ class ImageRaterApp(App[None]):
             placeholder.update("No files in this view — press v / f to change the view, e for formats")
             return
 
-        max_edge_px = self._compute_preview_edge_px()
+        max_edge_px = self._compute_preview_edge_px(self.query_one("#viewer").content_size)
         preview_future = self._preview_cache.request(self._session.resolve_path(current_file), max_edge_px=max_edge_px)
         self._prefetch_neighbours(max_edge_px=max_edge_px)
         if not preview_future.done():
@@ -836,6 +870,34 @@ class ImageRaterApp(App[None]):
         self._current_preview = preview
         self._display_preview(preview)
         self._refresh_sidebar()
+
+    async def _show_side_preview(self) -> None:
+        current_file = self._session.current_file
+        image_widget = self.query_one("#side-preview-image", ImageWidget)
+        box_size = self.query_one("#side-preview").content_size
+        if current_file is None or box_size.width == 0 or box_size.height == 0:
+            image_widget.image = None
+            return
+        max_edge_px = self._compute_preview_edge_px(box_size)
+        self._prefetch_neighbours(max_edge_px=max_edge_px)
+        preview = await self._preview_cache.get(self._session.resolve_path(current_file), max_edge_px=max_edge_px)
+        if self._session.current_file != current_file or not image_widget.is_attached:
+            return
+        if preview.image is None:
+            image_widget.image = None
+            return
+        cell_size = get_cell_size()
+        cell_box = fit_image_to_cells(
+            image_width_px=preview.image.width,
+            image_height_px=preview.image.height,
+            max_columns=box_size.width,
+            max_rows=box_size.height,
+            cell_width_px=cell_size.width,
+            cell_height_px=cell_size.height,
+        )
+        image_widget.styles.width = cell_box.columns
+        image_widget.styles.height = cell_box.rows
+        image_widget.image = preview.image
 
     def _display_preview(self, preview: Preview) -> None:
         preview_widget = self.query_one("#preview", ImageWidget)

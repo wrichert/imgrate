@@ -32,10 +32,19 @@ terminals with a graphics protocol (Ghostty, Kitty, WezTerm, iTerm2) they are sh
 - Export from the app (`E`) or the shell, by copy or symlink, flat or with sub folders
 - Choose which file formats take part (images on by default; `.mp4`, `.mov`, RAW etc. off unless you enable them)
 
+## Quick start
+
+Try it without cloning or installing anything (needs [uv](https://docs.astral.sh/uv/)):
+
+```sh
+uvx --from git+https://github.com/wrichert/lazyrate lazyrate ~/Pictures/2025
+```
+
 ## Install
 
 ```sh
-uv tool install git+https://github.com/wrichert/lazyrate
+uv tool install git+https://github.com/wrichert/lazyrate   # then: lazyrate ~/Pictures/2025
+uv tool upgrade lazyrate                                    # later, to update
 # or, from a checkout
 uv sync && uv run lazyrate ~/Pictures/2025
 ```
@@ -69,6 +78,7 @@ lazyrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e
 | `s` | cycle sort: rating (best first, default) · date taken · path |
 | `S` | re-sort / re-filter now (re-rated photos move to their new section) |
 | `g` | toggle thumbnail grid (default) / single image (`enter` in the grid opens the highlighted image) |
+| `p` | grid: switch the right pane between a large preview of the highlighted image and the metadata (remembered) |
 | `d` | toggle duplicates mode (each group is a section) |
 | `b` | duplicates mode: keep this one, reject the rest of the group, jump to next group |
 | `E` | export: pick ratings, destination, flat / symlink (remembered for next time) |

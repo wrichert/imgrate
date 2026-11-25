@@ -266,6 +266,7 @@ HELP_TEXT = """\
   s              cycle sort: rating (best first, default) · date taken · path — also sets the sections
   S              re-sort / re-filter now (re-rated files move to their new section)
   g              toggle thumbnail grid (default) / single image
+  p              grid: right pane shows the highlighted image large / metadata
   enter          grid → open highlighted image
 
 [b]Near duplicates[/b]  (fingerprints are computed in the background, once)
