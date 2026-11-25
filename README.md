@@ -18,6 +18,46 @@ themselves are never touched.
 <sub>Screenshot taken headless with generated demo images, so the thumbnails use the block-character fallback. In
 terminals with a graphics protocol (Ghostty, Kitty, WezTerm, iTerm2) they are shown at full resolution.</sub>
 
+## Use cases
+
+| You want to … | lazyrate helps by … |
+| --- | --- |
+| **Pick the 12 best photos of the year for a calendar** (or 50 for a photo book) | fast one-key rating, review only the ★★★★★, one section per month, export the keepers |
+| **Clean up a phone camera roll** | grouping bursts and near duplicates (`b` keeps one), AI flags screenshots, receipts and pocket shots as junk, `Y` rejects them in one go |
+| **Curate a trip album or slideshow** | sort by date taken, rate, export ≥ ★★★★ by copy or symlink, flat or with folders |
+| **Find that one photo** | AI text search: `/` → "dog in snow" |
+| **Keep up with new photos** | ratings stay with the folder; rescan, only new photos are unrated, the AI already knows your taste |
+
+lazyrate never deletes or modifies photos. Rejected photos are just marked; to clean up, export them
+(`lazyrate export ROOT ~/to-delete --rating 0 --symlink`) and decide there.
+
+## How it works
+
+```mermaid
+flowchart TD
+    folder["Photo folder<br/>thousands of photos"] --> start["lazyrate ~/Pictures/2025"]
+    start -. "background, once per photo" .-> index["Duplicate fingerprints<br/>+ AI image descriptions (optional)"]
+    start --> dupes["1 · Clear out bursts<br/>d: duplicate groups · b / B: keep the best"]
+    dupes --> pass["2 · Quick pass over the unrated<br/>x: reject · 1–5: stars"]
+    pass --> enough{"AI installed and<br/>≥ 10 rejected + ≥ 10 starred?"}
+    enough -- "no" --> narrow
+    enough -- "yes" --> learn["3 · AI learns your taste<br/>retrains every 10 ratings (L: now)"]
+    learn --> accept["Accept suggestions<br/>s: sort 'suggested rating' · y / Y: accept"]
+    accept --> teach["Teach it where it is unsure<br/>s: sort 'most informative'"]
+    teach --> learn
+    accept --> narrow["4 · Narrow down<br/>view ≥ ★★★★, compare, promote to ★★★★★"]
+    narrow --> export["5 · Export the keepers<br/>E: copy or symlink"]
+    export --> result["Calendar · photo book · album"]
+```
+
+1. **Start** lazyrate on a folder. It scans all sub folders and, in the background (with progress bars),
+   fingerprints every photo for duplicate detection and — with the AI extra — describes its content once.
+2. **Clear out bursts** in duplicates mode: keep the best shot of each group with one key.
+3. **Rate quickly**: one key per photo, the list doesn't jump while you rate, `z` undoes.
+4. **Let the AI help** (optional): after a few dozen ratings it suggests ratings for the rest; you accept them
+   per photo or per section, and teach it by rating the photos it is least sure about.
+5. **Narrow down and export**: view only the best, compare in the grid or full view, export.
+
 ## Features
 
 - Recursively scans a folder (hidden folders and NAS metadata like `@eaDir` are skipped)
@@ -136,6 +176,20 @@ Both are small linear models (numpy, retrained in well under a second) with clas
 photos are not drowned by 2,000 three-star ones. Unrated photos are never used as training data. Suggestions appear
 once you have rejected 10 and starred 10 photos; star suggestions after 30 starred photos.
 
+#### Getting the AI to rate your photos
+
+1. Wait until the **Reading image content** progress bar is done (first start only).
+2. Rate a mix by hand: at least 10 rejects (`x`) and 10 starred photos (`1`–`5`), ideally with different star
+   counts. The **AI** line in the sidebar says how many more it needs.
+3. It retrains automatically every 10 ratings; `L` retrains now.
+4. Press `s` until the sort says **suggested rating**. Unrated photos are grouped into sections like
+   "suggested ★★★★★" … "suggested junk"; thumbnails show what it thinks.
+5. Accept: `y` for the current photo, `Y` for the whole section (`z` undoes the batch). A good start: `J`/`K` to
+   **suggested junk**, skim it, `Y`.
+6. Make it smarter: `s` to **most informative**, rate a few dozen of those, `L`.
+
+#### What you see
+
 - Unrated thumbnails show a ghost label: `★★★★? 80%`, `junk? 92%`, `keeper? 70%` (stars not learned yet).
 - `s` adds two sorts: **suggested rating** (best suggestions first, surest junk together — `Y` rejects them in one
   go) and **most informative** (the photos the model is least sure about first: rating these teaches it the most).
@@ -144,15 +198,28 @@ once you have rejected 10 and starred 10 photos; star suggestions after 30 starr
 - `lazyrate stats` / `classify` report cross-validated accuracy, e.g. "within ±1 star 87%", so you can judge
   how much to trust it. Expect junk detection to be very good and exact stars to be a matter of taste (±1).
 
-### Suggested workflow for a calendar
+### Recipes
 
-1. Press `d` and `g`: go through the duplicate groups, `b` on the best shot of each burst.
-   Press `d` again to leave.
-   With AI: reject ~10 junk photos and star ~10 good ones, then `s` → **suggested rating**, jump to
-   **suggested junk** and check it, `Y` to reject the section.
-2. View **unrated**, go through quickly: `x` for rejects, `3` for "maybe", `4`/`5` for good ones.
-3. View **≥ ★★★★** in grid mode (`g`), compare, promote the best to `5`, demote the rest.
-4. View **★★★★★ only**, `s` to sort by date taken (one section per month), until 12–13 remain, then `E` to export.
+**Year calendar (12 photos out of thousands)**
+
+1. `d`: go through the duplicate groups, `b` (or `B` with AI) on the best shot of each burst; `d` again to leave.
+2. `v` until the view is **unrated**, go through quickly: `x` reject, `3` "maybe", `4`/`5` good.
+   With AI: after ~20 ratings switch the sort to **suggested rating** and accept whole sections with `Y`.
+3. View **≥ ★★★★** in the grid, `p` for a large preview or `enter` for full view, promote the best to `5`.
+4. View **★★★★★ only**, `s` to **date taken** (one section per month), until 12–13 remain, `E` to export.
+
+**Camera roll clean-up**
+
+1. `d`, `b` through the bursts.
+2. With AI: reject 10 screenshots / receipts / blurry shots and star 10 real photos, sort **suggested rating**,
+   check **suggested junk**, `Y`.
+3. `lazyrate export ROOT ~/to-delete --rating 0 --symlink` collects the rejects for a final look before you delete
+   them with your usual tool.
+
+**Find a photo**
+
+`/` and describe it ("birthday cake", "boat at sunset"); best matches come first, `esc` ends the search.
+From the shell: `lazyrate search ROOT "birthday cake"`.
 
 ## Development
 
