@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from imgrate.fingerprints import count_differing_bits
+from lazyrate.fingerprints import count_differing_bits
 
 
 @dataclass(frozen=True, slots=True)

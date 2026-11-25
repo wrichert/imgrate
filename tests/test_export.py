@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from imgrate.export import ExportOptions, export_files, select_export_ratings, validate_destination
+from lazyrate.export import ExportOptions, export_files, select_export_ratings, validate_destination
 
 if TYPE_CHECKING:
     from pathlib import Path

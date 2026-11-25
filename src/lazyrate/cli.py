@@ -1,4 +1,4 @@
-"""Command line entry point: ``imgrate ROOT``, ``imgrate stats ROOT``, ``imgrate export ROOT DEST``."""
+"""Command line entry point: ``lazyrate ROOT``, ``lazyrate stats ROOT``, ``lazyrate export ROOT DEST``."""
 
 from __future__ import annotations
 
@@ -6,16 +6,16 @@ import argparse
 import sys
 from pathlib import Path
 
-from imgrate.export import ExportOptions, export_files, select_export_ratings
-from imgrate.media import scan_media_files
-from imgrate.ratings import ALL_BUCKETS, MAX_STARS, REJECTED, describe_bucket
-from imgrate.store import RatingStore
+from lazyrate.export import ExportOptions, export_files, select_export_ratings
+from lazyrate.media import scan_media_files
+from lazyrate.ratings import ALL_BUCKETS, MAX_STARS, REJECTED, describe_bucket
+from lazyrate.store import LEGACY_DATABASE_FILE_NAME, RatingStore, find_legacy_database, migrate_legacy_database
 
 SUBCOMMANDS = frozenset({"rate", "stats", "export"})
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="imgrate", description="Rate all images in a folder tree, fast.")
+    parser = argparse.ArgumentParser(prog="lazyrate", description="Rate all images in a folder tree, fast.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     rate_parser = subparsers.add_parser("rate", help="open the rating TUI (default command)")
@@ -50,16 +50,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     if not arguments:
         parser.print_usage(sys.stderr)
-        print("imgrate: error: photo folder missing, e.g. `imgrate ~/Pictures/2025`", file=sys.stderr)
+        print("lazyrate: error: photo folder missing, e.g. `lazyrate ~/Pictures/2025`", file=sys.stderr)
         return 2
-    # `imgrate ~/Photos` is shorthand for `imgrate rate ~/Photos`.
+    # `lazyrate ~/Photos` is shorthand for `lazyrate rate ~/Photos`.
     if arguments[0] not in SUBCOMMANDS and arguments[0] not in {"-h", "--help"}:
         arguments = ["rate", *arguments]
     parsed = parser.parse_args(arguments)
     root = parsed.root.expanduser().resolve()
     if not root.is_dir():
-        print(f"imgrate: not a directory: {root}", file=sys.stderr)
+        print(f"lazyrate: not a directory: {root}", file=sys.stderr)
         return 2
+    if parsed.db is None and find_legacy_database(root) is not None:
+        migrate_legacy_database(root)
+        print(f"lazyrate: renamed {LEGACY_DATABASE_FILE_NAME} to {RatingStore.DEFAULT_FILE_NAME}", file=sys.stderr)
     database_path = parsed.db or root / RatingStore.DEFAULT_FILE_NAME
 
     if parsed.command == "rate":
@@ -72,7 +75,7 @@ def main(argv: list[str] | None = None) -> int:
         selected_ratings = select_export_ratings(min_rating=parsed.min_rating, exact_ratings=parsed.ratings)
         if not selected_ratings:
             print(
-                f"imgrate: --rating must be {REJECTED}..{MAX_STARS}, --min-rating must be 1..{MAX_STARS}",
+                f"lazyrate: --rating must be {REJECTED}..{MAX_STARS}, --min-rating must be 1..{MAX_STARS}",
                 file=sys.stderr,
             )
             return 2
@@ -89,7 +92,7 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
         except ValueError as error:
-            print(f"imgrate: {error}", file=sys.stderr)
+            print(f"lazyrate: {error}", file=sys.stderr)
             return 2
         for target_path in summary.target_paths:
             print(target_path)
@@ -106,8 +109,8 @@ def main(argv: list[str] | None = None) -> int:
 
 def run_tui(*, root: Path, database_path: Path) -> int:
     # Imported lazily: textual_image probes the terminal on import, which is not wanted for stats/export.
-    from imgrate.app import ImageRaterApp
-    from imgrate.session import RatingSession
+    from lazyrate.app import ImageRaterApp
+    from lazyrate.session import RatingSession
 
     print(f"Scanning {root} …", file=sys.stderr)
     scan_result = scan_media_files(root)

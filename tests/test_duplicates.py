@@ -4,13 +4,13 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from imgrate.duplicates import DuplicateFinder, HashedFile
-from imgrate.fingerprints import Fingerprint, compute_image_signature, count_differing_bits
+from lazyrate.duplicates import DuplicateFinder, HashedFile
+from lazyrate.fingerprints import Fingerprint, compute_image_signature, count_differing_bits
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from imgrate.store import RatingStore
+    from lazyrate.store import RatingStore
 
 
 def test_near_duplicates_have_close_hashes_and_different_images_do_not(burst_root: Path) -> None:

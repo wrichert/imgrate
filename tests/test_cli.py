@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from imgrate.cli import main
-from imgrate.export import build_unique_flat_name
-from imgrate.store import RatingStore
+from lazyrate.cli import main
+from lazyrate.export import build_unique_flat_name
+from lazyrate.store import RatingStore
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -75,3 +75,15 @@ def test_missing_photo_folder_is_an_error_instead_of_scanning_the_current_direct
 
     assert exit_code == 2
     assert "photo folder missing" in capsys.readouterr().err
+
+
+def test_legacy_imgrate_database_is_renamed_and_keeps_ratings(photo_root: Path) -> None:
+    legacy_store = RatingStore(photo_root / ".imgrate.sqlite")
+    legacy_store.set_rating(relative_path="2023/a.jpg", rating=5)
+    legacy_store.close()
+
+    exit_code = main(["stats", str(photo_root)])
+
+    assert exit_code == 0
+    assert not (photo_root / ".imgrate.sqlite").exists()
+    assert RatingStore(photo_root / RatingStore.DEFAULT_FILE_NAME).load_ratings() == {"2023/a.jpg": 5}

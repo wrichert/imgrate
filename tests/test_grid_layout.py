@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from imgrate.grid_layout import (
+from lazyrate.grid_layout import (
     build_grid_rows,
     find_index_in_adjacent_row,
     find_page_index,
     paginate_grid_rows,
 )
-from imgrate.session import Section
+from lazyrate.session import Section
 
 SECTIONS = [
     Section(label="★★★★★", start_index=0, end_index=5),

@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from imgrate.media import normalize_extension, scan_media_files
+from lazyrate.media import normalize_extension, scan_media_files
 
 if TYPE_CHECKING:
     from pathlib import Path

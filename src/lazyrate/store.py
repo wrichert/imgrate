@@ -7,8 +7,8 @@ import sqlite3
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from imgrate.fingerprints import Fingerprint
-from imgrate.ratings import MAX_STARS, REJECTED
+from lazyrate.fingerprints import Fingerprint
+from lazyrate.ratings import MAX_STARS, REJECTED
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -28,13 +28,37 @@ def to_unsigned_64_bit(value: int) -> int:
     return value + SIGNED_64_BIT_OFFSET if value < 0 else value
 
 
+LEGACY_DATABASE_FILE_NAME = ".imgrate.sqlite"
+"""Database name before the rename to lazyrate."""
+SQLITE_SIDECAR_SUFFIXES = ("", "-wal", "-shm")
+
+
+def find_legacy_database(root: Path) -> Path | None:
+    """The pre-rename database in ``root``, if there is one and no lazyrate database exists yet."""
+    legacy_path = root / LEGACY_DATABASE_FILE_NAME
+    if not legacy_path.is_file() or (root / RatingStore.DEFAULT_FILE_NAME).exists():
+        return None
+    return legacy_path
+
+
+def migrate_legacy_database(root: Path) -> None:
+    """Rename ``.imgrate.sqlite`` (plus its WAL / SHM files) to ``.lazyrate.sqlite``; no-op if there is none."""
+    legacy_path = find_legacy_database(root)
+    if legacy_path is None:
+        return
+    for suffix in SQLITE_SIDECAR_SUFFIXES:
+        legacy_file = legacy_path.with_name(legacy_path.name + suffix)
+        if legacy_file.exists():
+            legacy_file.rename(root / (RatingStore.DEFAULT_FILE_NAME + suffix))
+
+
 class RatingStore:
     """Ratings keyed by path relative to the photo root, so the folder can be moved.
 
     Rating values: ``0`` = rejected, ``1..5`` = stars. Unrated files have no row.
     """
 
-    DEFAULT_FILE_NAME = ".imgrate.sqlite"
+    DEFAULT_FILE_NAME = ".lazyrate.sqlite"
     _ENABLED_EXTENSIONS_KEY = "enabled_extensions"
     _SCHEMA = """
         CREATE TABLE IF NOT EXISTS ratings (

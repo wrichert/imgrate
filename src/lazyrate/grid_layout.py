@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from imgrate.session import Section
+    from lazyrate.session import Section
 
 
 @dataclass(frozen=True, slots=True)

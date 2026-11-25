@@ -23,9 +23,9 @@ from textual.worker import get_current_worker
 from textual_image.widget import Image as ImageWidget
 from textual_image.widget import get_cell_size
 
-from imgrate.export import ExportOptions, ExportSummary, export_files
-from imgrate.fingerprints import Fingerprint, compute_image_signature
-from imgrate.grid_layout import (
+from lazyrate.export import ExportOptions, ExportSummary, export_files
+from lazyrate.fingerprints import Fingerprint, compute_image_signature
+from lazyrate.grid_layout import (
     GridPage,
     GridRow,
     build_grid_rows,
@@ -33,12 +33,12 @@ from imgrate.grid_layout import (
     find_page_index,
     paginate_grid_rows,
 )
-from imgrate.media import scan_media_files
-from imgrate.preview import PreviewCache
-from imgrate.ratings import ALL_BUCKETS, FILTER_PRESETS, MAX_STARS, REJECTED, describe_bucket, format_stars
-from imgrate.screens import ExportRequest, ExportScreen, ExtensionsScreen, HelpScreen, RatingFilterScreen
-from imgrate.session import SortOrder
-from imgrate.store import RatingStore
+from lazyrate.media import scan_media_files
+from lazyrate.preview import PreviewCache
+from lazyrate.ratings import ALL_BUCKETS, FILTER_PRESETS, MAX_STARS, REJECTED, describe_bucket, format_stars
+from lazyrate.screens import ExportRequest, ExportScreen, ExtensionsScreen, HelpScreen, RatingFilterScreen
+from lazyrate.session import SortOrder
+from lazyrate.store import RatingStore
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -48,10 +48,10 @@ if TYPE_CHECKING:
     from textual.timer import Timer
     from textual.widget import Widget
 
-    from imgrate.media import MediaFile, ScanResult
-    from imgrate.preview import Preview
-    from imgrate.ratings import RatingFilter
-    from imgrate.session import RatingSession
+    from lazyrate.media import MediaFile, ScanResult
+    from lazyrate.preview import Preview
+    from lazyrate.ratings import RatingFilter
+    from lazyrate.session import RatingSession
 
 
 BYTES_PER_KILOBYTE = 1024
@@ -178,7 +178,7 @@ class ThumbnailCell(Vertical):
 class ImageRaterApp(App[None]):
     """Rate thousands of photos fast; review any rating bucket; persist everything in SQLite."""
 
-    TITLE = "imgrate"
+    TITLE = "lazyrate"
     DEFAULT_SORT_ORDER = SortOrder.RATING
     EXPORT_OPTIONS_SETTING_KEY = "export_options"
     SECTION_LIST_MAX_LINES = 9

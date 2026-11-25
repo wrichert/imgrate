@@ -1,5 +1,5 @@
 [project]
-name = "imgrate"
+name = "lazyrate"
 version = "0.1.0"
 description = "Terminal UI to rate thousands of images fast and keep only the best"
 readme = "README.md"
@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [project.scripts]
-imgrate = "imgrate:main"
+lazyrate = "lazyrate:main"
 
 [build-system]
 requires = ["uv_build>=0.13.9,<0.14.0"]

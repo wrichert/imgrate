@@ -9,16 +9,16 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from imgrate.duplicates import DuplicateFinder, DuplicateGroup, HashedFile
-from imgrate.media import IMAGE_EXTENSIONS, MediaFile, ScanResult, build_path_sort_key
-from imgrate.ratings import ALL_FILTER, MAX_STARS, REJECTED, RatingBucket, RatingFilter, describe_bucket
+from lazyrate.duplicates import DuplicateFinder, DuplicateGroup, HashedFile
+from lazyrate.media import IMAGE_EXTENSIONS, MediaFile, ScanResult, build_path_sort_key
+from lazyrate.ratings import ALL_FILTER, MAX_STARS, REJECTED, RatingBucket, RatingFilter, describe_bucket
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
     from pathlib import Path
 
-    from imgrate.fingerprints import Fingerprint
-    from imgrate.store import RatingStore
+    from lazyrate.fingerprints import Fingerprint
+    from lazyrate.store import RatingStore
 
 
 class SortOrder(StrEnum):

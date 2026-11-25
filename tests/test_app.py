@@ -6,12 +6,12 @@ from typing import TYPE_CHECKING
 from PIL import Image
 from textual.widgets import Input, Static
 
-from imgrate.app import ImageRaterApp, SectionHeader, ThumbnailCell, fit_image_to_cells
-from imgrate.media import scan_media_files
-from imgrate.ratings import REJECTED
-from imgrate.screens import ExportScreen
-from imgrate.session import RatingSession, SortOrder
-from imgrate.store import RatingStore
+from lazyrate.app import ImageRaterApp, SectionHeader, ThumbnailCell, fit_image_to_cells
+from lazyrate.media import scan_media_files
+from lazyrate.ratings import REJECTED
+from lazyrate.screens import ExportScreen
+from lazyrate.session import RatingSession, SortOrder
+from lazyrate.store import RatingStore
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -178,7 +178,7 @@ async def test_starts_in_rating_sorted_grid_and_capital_s_resorts(session: Ratin
 
 
 async def test_c_copies_full_path_to_clipboard(session: RatingSession, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("imgrate.app.shutil.which", lambda _command: None)  # no clipboard tool -> OSC 52 fallback
+    monkeypatch.setattr("lazyrate.app.shutil.which", lambda _command: None)  # no clipboard tool -> OSC 52 fallback
     app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
 
     async with app.run_test(size=(140, 40)) as pilot:

@@ -4,14 +4,14 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from imgrate.media import scan_media_files
-from imgrate.ratings import ALL_FILTER, REJECTED, UNRATED_FILTER, build_minimum_stars_filter
-from imgrate.session import RatingSession, SortOrder
+from lazyrate.media import scan_media_files
+from lazyrate.ratings import ALL_FILTER, REJECTED, UNRATED_FILTER, build_minimum_stars_filter
+from lazyrate.session import RatingSession, SortOrder
 
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from imgrate.store import RatingStore
+    from lazyrate.store import RatingStore
 
 
 def visible_paths(session: RatingSession) -> list[str]:

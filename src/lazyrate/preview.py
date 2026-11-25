@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
 from pillow_heif import register_heif_opener
 
-from imgrate.media import IMAGE_EXTENSIONS
+from lazyrate.media import IMAGE_EXTENSIONS
 
 if TYPE_CHECKING:
     from pathlib import Path

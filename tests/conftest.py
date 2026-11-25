@@ -5,9 +5,9 @@ from typing import TYPE_CHECKING
 import pytest
 from PIL import Image
 
-from imgrate.media import scan_media_files
-from imgrate.session import RatingSession
-from imgrate.store import RatingStore
+from lazyrate.media import scan_media_files
+from lazyrate.session import RatingSession
+from lazyrate.store import RatingStore
 
 if TYPE_CHECKING:
     from collections.abc import Iterator

@@ -12,9 +12,9 @@ from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, SelectionList, Static
 from textual.widgets.selection_list import Selection
 
-from imgrate.export import ExportOptions, validate_destination
-from imgrate.media import IMAGE_EXTENSIONS, RAW_EXTENSIONS, VIDEO_EXTENSIONS
-from imgrate.ratings import ALL_BUCKETS, RatingBucket, RatingFilter, build_custom_filter, describe_bucket
+from lazyrate.export import ExportOptions, validate_destination
+from lazyrate.media import IMAGE_EXTENSIONS, RAW_EXTENSIONS, VIDEO_EXTENSIONS
+from lazyrate.ratings import ALL_BUCKETS, RatingBucket, RatingFilter, build_custom_filter, describe_bucket
 
 if TYPE_CHECKING:
     from textual.app import ComposeResult
@@ -283,7 +283,7 @@ HELP_TEXT = """\
   q              quit
 
 Ratings are saved immediately to the SQLite file shown in the sidebar.
-Export from the shell:  imgrate export ROOT DEST --rating 5   (repeatable; or --min-rating 4)
+Export from the shell:  lazyrate export ROOT DEST --rating 5   (repeatable; or --min-rating 4)
 """
 
 

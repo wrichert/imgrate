@@ -6,7 +6,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from imgrate.ratings import MAX_STARS, REJECTED
+from lazyrate.ratings import MAX_STARS, REJECTED
 
 
 @dataclass(frozen=True, slots=True)
