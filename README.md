@@ -164,7 +164,21 @@ Section counts are live: a section with re-rated photos waiting for `S` is marke
 
 ### AI suggestions (optional)
 
-With the `ml` extra installed, lazyrate describes every photo once with [CLIP](https://github.com/mlfoundations/open_clip)
+The AI features need the `ml` extra (torch + open_clip):
+
+```sh
+# one-off run, nothing installed
+uvx --from 'lazyrate[ml] @ git+https://github.com/wrichert/lazyrate' lazyrate ~/Pictures/2025
+# installed tool (if you already installed it without AI, add --force to replace it)
+uv tool install 'lazyrate[ml] @ git+https://github.com/wrichert/lazyrate'
+# from a checkout
+uv sync --extra ml && uv run lazyrate ~/Pictures/2025
+```
+
+The first start downloads the model (~600 MB, cached by Hugging Face). Without the extra, lazyrate works as before
+and the AI keys only tell you how to install it.
+
+With the extra installed, lazyrate describes every photo once with [CLIP](https://github.com/mlfoundations/open_clip)
 (ViT-B/32, LAION-2B weights; ~400 photos/s on an Apple GPU, cached in the database, about 1 KB per photo) and learns
 from the ratings you give:
 
