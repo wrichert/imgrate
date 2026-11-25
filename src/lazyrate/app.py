@@ -267,7 +267,8 @@ class ImageRaterApp(App[None]):
         Binding("g", "toggle_grid", "Grid"),
         Binding("d", "toggle_duplicates", "Dupes"),
         Binding("b", "keep_best_of_group", "Best of group"),
-        Binding("enter", "open_from_grid", "Open", show=False),
+        Binding("enter", "toggle_full_view", "Full view", show=False),
+        Binding("escape", "leave_full_view", "Back", show=False),
         Binding("E", "export", "Export"),
         Binding("e", "choose_extensions", "Formats"),
         Binding("o", "open_external", "Open ext"),
@@ -287,6 +288,7 @@ class ImageRaterApp(App[None]):
         self._preview_cache = PreviewCache()
         self._is_auto_advance = True
         self._is_grid_mode = True
+        self._is_full_view = False
         self._is_side_preview_enabled = False
         self._grid_layout_key: GridLayoutKey | None = None
         self._grid_rows: list[GridRow] = []
@@ -333,7 +335,7 @@ class ImageRaterApp(App[None]):
         self._navigate(lambda: self._session.move_by(delta))
 
     def action_move_row(self, direction: int) -> None:
-        if not (self._is_grid_mode and self._grid_rows):
+        if not (self._is_grid_shown and self._grid_rows):
             self._navigate(lambda: self._session.move_by(direction))
             return
         target_index = find_index_in_adjacent_row(
@@ -342,7 +344,7 @@ class ImageRaterApp(App[None]):
         self._navigate(lambda: self._session.move_to(target_index))
 
     def action_move_page(self, direction: int) -> None:
-        if not (self._is_grid_mode and self._grid_pages):
+        if not (self._is_grid_shown and self._grid_pages):
             self._navigate(lambda: self._session.move_by(direction * self.PAGE_JUMP_SIZE))
             return
         page_index = find_page_index(self._grid_pages, self._session.current_index)
@@ -450,6 +452,7 @@ class ImageRaterApp(App[None]):
 
     def action_toggle_grid(self) -> None:
         self._is_grid_mode = not self._is_grid_mode
+        self._is_full_view = False
         self._apply_view_mode()
         self.call_after_refresh(self._refresh_all)
 
@@ -458,9 +461,15 @@ class ImageRaterApp(App[None]):
         self.notify(f"Re-sorted ({self._session.visible_count:,} files)", timeout=2)
         self._refresh_all()
 
-    def action_open_from_grid(self) -> None:
-        if self._is_grid_mode:
-            self.action_toggle_grid()
+    def action_toggle_full_view(self) -> None:
+        """Enter: the current image alone on the screen; enter / escape returns to the grid or single view."""
+        self._is_full_view = not self._is_full_view
+        self._apply_view_mode()
+        self.call_after_refresh(self._refresh_all)
+
+    def action_leave_full_view(self) -> None:
+        if self._is_full_view:
+            self.action_toggle_full_view()
 
     def action_open_external(self) -> None:
         current_file = self._session.current_file
@@ -671,11 +680,18 @@ class ImageRaterApp(App[None]):
     @property
     def _is_side_preview_shown(self) -> bool:
         """In single view the main area already shows the image large, so the pane keeps the metadata."""
-        return self._is_side_preview_enabled and self._is_grid_mode
+        return self._is_side_preview_enabled and self._is_grid_shown
+
+    @property
+    def _is_grid_shown(self) -> bool:
+        """Full view temporarily replaces the grid; ``_is_grid_mode`` remembers where to return to."""
+        return self._is_grid_mode and not self._is_full_view
 
     def _apply_view_mode(self) -> None:
-        self.query_one("#viewer").display = not self._is_grid_mode
-        self.query_one("#grid").display = self._is_grid_mode
+        self.query_one("#viewer").display = not self._is_grid_shown
+        self.query_one("#grid").display = self._is_grid_shown
+        self.query_one("#sidebar").display = not self._is_full_view
+        self.query_one(Footer).display = not self._is_full_view
         self.query_one("#sidebar").set_class(self._is_side_preview_shown, "-preview")
 
     def _move_to_next_unrated(self) -> None:
@@ -705,7 +721,7 @@ class ImageRaterApp(App[None]):
     def _refresh_all(self) -> None:
         if self._find_grid() is None:
             return
-        if self._is_grid_mode:
+        if self._is_grid_shown:
             self._refresh_grid()
         else:
             self.run_worker(self._show_current_preview(), exclusive=True, group="preview")

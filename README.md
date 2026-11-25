@@ -77,7 +77,8 @@ lazyrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e
 | `f` | choose any combination of ratings to view |
 | `s` | cycle sort: rating (best first, default) · date taken · path |
 | `S` | re-sort / re-filter now (re-rated photos move to their new section) |
-| `g` | toggle thumbnail grid (default) / single image (`enter` in the grid opens the highlighted image) |
+| `g` | toggle thumbnail grid (default) / single image |
+| `enter` | full view of the image (nothing else on screen); `enter` or `esc` returns to the previous view |
 | `p` | grid: switch the right pane between a large preview of the highlighted image and the metadata (remembered) |
 | `d` | toggle duplicates mode (each group is a section) |
 | `b` | duplicates mode: keep this one, reject the rest of the group, jump to next group |

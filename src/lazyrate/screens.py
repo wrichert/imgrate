@@ -267,7 +267,7 @@ HELP_TEXT = """\
   S              re-sort / re-filter now (re-rated files move to their new section)
   g              toggle thumbnail grid (default) / single image
   p              grid: right pane shows the highlighted image large / metadata
-  enter          grid → open highlighted image
+  enter          full view of the image; enter / esc returns to grid or single view
 
 [b]Near duplicates[/b]  (fingerprints are computed in the background, once)
   d              toggle duplicates mode: groups of similar shots taken ≤ 15 min apart

@@ -325,3 +325,26 @@ async def test_copying_a_path_with_brackets_does_not_break_markup(
         copied_path = app.clipboard
 
     assert copied_path.endswith("[2024] summer/[b]beach.jpg")
+
+
+async def test_enter_opens_full_view_and_returns_to_previous_view(session: RatingSession) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+
+    async with app.run_test(size=(140, 40)) as pilot:
+        await pilot.press("enter")
+        await pilot.pause()
+        is_full_view_from_grid = app.query_one("#viewer").display and not app.query_one("#sidebar").display
+        await pilot.press("enter")
+        await pilot.pause()
+        is_back_in_grid = app.query_one("#grid").display and app.query_one("#sidebar").display
+        await pilot.press("g", "enter")
+        await pilot.pause()
+        is_full_view_from_single = not app.query_one("#sidebar").display
+        await pilot.press("escape")
+        await pilot.pause()
+        is_back_in_single_view = app.query_one("#viewer").display and app.query_one("#sidebar").display
+
+    assert is_full_view_from_grid
+    assert is_back_in_grid
+    assert is_full_view_from_single
+    assert is_back_in_single_view
