@@ -81,7 +81,7 @@ Try it without cloning or installing anything (needs [uv](https://docs.astral.sh
 
 ```sh
 uvx --from git+https://github.com/wrichert/lazyrate lazyrate ~/Pictures/2025
-# with AI suggestions and search (pulls in torch, first start downloads a ~600 MB model):
+# with AI suggestions and search (~600 MB torch + 605 MB CLIP model on first start; ~400 photos/s on Apple GPUs):
 uvx --from 'lazyrate[ml] @ git+https://github.com/wrichert/lazyrate' lazyrate ~/Pictures/2025
 ```
 
@@ -175,8 +175,17 @@ uv tool install 'lazyrate[ml] @ git+https://github.com/wrichert/lazyrate'
 uv sync --extra ml && uv run lazyrate ~/Pictures/2025
 ```
 
-The first start downloads the model (~600 MB, cached by Hugging Face). Without the extra, lazyrate works as before
-and the AI keys only tell you how to install it.
+What that costs:
+
+| Part | Download / disk | When |
+|---|---|---|
+| torch + open_clip (the `ml` extra) | ~600 MB installed | once, at install |
+| CLIP ViT-B/32 weights (`laion2b_s34b_b79k`) | 605 MB, kept in `~/.cache/huggingface` | once, on first AI start |
+| Photo descriptions (embeddings) | ~1 KB per photo, in the folder's `.lazyrate.sqlite` | once per photo, ~400 photos/s on Apple GPUs (MPS); slower on CPU |
+| Junk and star models (the rating regressors) | nothing: plain numpy, trained on your ratings | retrained in well under a second, after every 10 ratings or on `L` |
+
+Everything runs locally; no photo or rating leaves your machine. Without the extra, lazyrate works as before and
+the AI keys only tell you how to install it.
 
 With the extra installed, lazyrate describes every photo once with [CLIP](https://github.com/mlfoundations/open_clip)
 (ViT-B/32, LAION-2B weights; ~400 photos/s on an Apple GPU, cached in the database, about 1 KB per photo) and learns
