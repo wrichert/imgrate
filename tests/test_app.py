@@ -7,7 +7,8 @@ from PIL import Image
 from textual.content import Content
 from textual.widgets import Input, Static
 
-from lazyrate.app import ImageRaterApp, SectionHeader, ThumbnailCell, fit_image_to_cells
+from lazyrate.app import ImageRaterApp, SectionHeader, SidePaneMode, ThumbnailCell, fit_image_to_cells
+from lazyrate.geo_map import BROWSER_MAP_FILE_NAME, Basemap
 from lazyrate.media import scan_media_files
 from lazyrate.ratings import REJECTED
 from lazyrate.screens import HELP_TEXT, ExportScreen
@@ -290,7 +291,7 @@ async def test_p_switches_right_pane_to_large_preview_and_is_remembered(
     assert is_preview_pane and is_image_loaded
     assert is_sections_hidden
     assert not is_preview_pane_in_single_view
-    assert store.load_setting(ImageRaterApp.SIDE_PANE_SETTING_KEY) == ImageRaterApp.SIDE_PANE_PREVIEW
+    assert store.load_setting(ImageRaterApp.SIDE_PANE_SETTING_KEY) == SidePaneMode.PREVIEW
 
 
 def test_help_text_is_valid_markup() -> None:
@@ -461,14 +462,114 @@ async def test_ten_new_ratings_retrain_the_model(mixed_root: Path, color_embedde
     assert rejected_count == 12 + ImageRaterApp.RETRAIN_AFTER_RATING_COUNT
 
 
-async def test_without_ai_the_search_key_explains_how_to_enable_it(session: RatingSession) -> None:
-    app = ImageRaterApp(session=session, database_path=session.root / "db.sqlite")
+async def test_without_ai_search_still_finds_places_and_explains_text_search(geo_root: Path) -> None:
+    store = RatingStore(geo_root / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(geo_root), store=store)
+    app = ImageRaterApp(session=session, database_path=store.database_path)
 
-    async with app.run_test(size=(140, 40)) as pilot:
-        await pilot.press("slash")
-        await pilot.pause()
-        screen_name = type(app.screen).__name__
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_locations(pilot, session)
+        await search_for(pilot, "sunset")
+        query_after_text_search = session.search_query
+        await search_for(pilot, "madeira")
+        section_labels = [section.label for section in session.sections]
         settings_text = str(app.query_one("#settings", Static).render())
+    store.close()
 
-    assert screen_name != "SearchScreen"
+    assert query_after_text_search is None
+    assert session.search_query == "madeira"
+    assert section_labels[:2] == ["Portugal › Madeira › Funchal", "Portugal › Madeira › São Jorge"]  # noqa: RUF001
+    assert section_labels[-1] == "other photos"
     assert "AI  off" in settings_text
+
+
+async def wait_for_locations(pilot: Pilot[None], session: RatingSession) -> None:
+    for _ in range(100):
+        await pilot.pause(0.05)
+        if not session.find_files_missing_locations():
+            return
+    raise AssertionError("GPS locations not read after 5 s")
+
+
+async def search_for(pilot: Pilot[None], query: str) -> None:
+    await pilot.press("slash")
+    await pilot.pause()
+    pilot.app.screen.query_one(Input).value = query
+    await pilot.press("enter")
+    await pilot.pause()
+
+
+async def test_radius_search_and_info_panel_show_the_place(geo_root: Path) -> None:
+    store = RatingStore(geo_root / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(geo_root), store=store)
+    app = ImageRaterApp(session=session, database_path=store.database_path)
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_locations(pilot, session)
+        await search_for(pilot, "@32.6657,-16.9255 5km")
+        current_path = session.current_file.relative_path if session.current_file else None
+        info_text = str(app.query_one("#info", Static).render())
+    store.close()
+
+    assert current_path == "madeira/funchal_1.jpg"
+    assert session.sections[0].label == "< 1 km"
+    assert "Funchal, Madeira, Portugal" in info_text
+    assert "32.66570, -16.92550" in info_text
+
+
+async def test_place_plus_text_ranks_within_the_place_with_ai(geo_root: Path, color_embedder: ColorEmbedder) -> None:
+    store = RatingStore(geo_root / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(geo_root), store=store)
+    app = ImageRaterApp(session=session, database_path=store.database_path, embedder_factory=lambda: color_embedder)
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_locations(pilot, session)
+        for _ in range(100):
+            await pilot.pause(0.05)
+            if app._is_ai_search_ready:
+                break
+        await search_for(pilot, "white madeira")
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if session.search_query is not None:
+                break
+        first_paths = [media_file.relative_path for media_file in session.visible_files[:3]]
+    store.close()
+
+    assert first_paths[0] == "madeira/funchal_1.jpg"
+    assert set(first_paths) == {"madeira/funchal_1.jpg", "madeira/funchal_2.jpg", "madeira/north_coast.jpg"}
+    assert session.sections[1].label == "other photos"
+
+
+async def test_m_shows_the_map_of_search_matches_and_capital_m_writes_the_browser_map(
+    geo_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = RatingStore(geo_root / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(geo_root), store=store)
+    app = ImageRaterApp(session=session, database_path=store.database_path)
+    opened_paths: list[Path] = []
+    monkeypatch.setattr(app, "_open_with_default_app", opened_paths.append)
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_locations(pilot, session)
+        await search_for(pilot, "madeira")
+        await pilot.press("m")
+        for _ in range(60):
+            await pilot.pause(0.05)
+            if app.query_one("#side-preview-image").image is not None:
+                break
+        map_image = app.query_one("#side-preview-image").image
+        await pilot.press("M")
+        for _ in range(60):
+            await pilot.pause(0.05)
+            if opened_paths:
+                break
+    store.close()
+
+    assert map_image is not None
+    assert Basemap.COLORS.current in {color for _count, color in map_image.getcolors(maxcolors=1_000_000)}
+    assert opened_paths == [geo_root / BROWSER_MAP_FILE_NAME]
+    page = opened_paths[0].read_text()
+    assert page.count('"path": ') == 3
+    assert "munich" not in page
+    assert store.database_path.exists()

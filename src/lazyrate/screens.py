@@ -263,11 +263,13 @@ HELP_TEXT = """\
 [b]Review[/b]
   v / V          cycle rating view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected
   f              choose rating view (any combination)
-  s              cycle sort: rating (best first, default) · date taken · path
+  s              cycle sort: rating (best first, default) · date taken · path · place (photos with GPS)
                  (+ suggested rating · most informative once AI suggestions exist) — also sets the sections
   S              re-sort / re-filter now (re-rated files move to their new section)
   g              toggle thumbnail grid (default) / single image
   p              grid: right pane shows the highlighted image large / metadata
+  m              right pane shows a map of the photos in the view (or the search matches) / metadata
+  M              open that map in the browser (OpenStreetMap / satellite; thumbnails in the popups)
   enter          full view of the image; enter / esc returns to grid or single view
 
 [b]Near duplicates[/b]  (fingerprints are computed in the background, once)
@@ -275,11 +277,16 @@ HELP_TEXT = """\
   b              keep this one, reject the rest of its group, go to next group
   v / f          in duplicates mode: show groups with at least one matching member
 
+[b]Places[/b]  (GPS data is read in the background, once; town names are looked up offline)
+  /              search by place: madeira · funchal · portugal (town, region or country, any accents)
+                 or by coordinates: @32.75,-16.95 50km · 32.75 -16.95 +-5km (default radius 10 km)
+  esc            ends the search
+
 [b]AI suggestions & search[/b]  (optional "ml" install; learns from your own ratings, nothing leaves the computer)
   y              accept the suggestion for this photo (ghost label, e.g. ★★★★? 80% or junk? 92%)
   Y              accept the suggestions of every unrated photo in this section (one undo step)
   B              duplicates mode: keep the suggested best of the group, reject the rest
-  /              search photos by content ("beach sunset", "receipt"); esc ends the search
+  /              search by content ("beach sunset", "receipt"); combine with a place: "beach madeira"
   L              retrain now (also happens automatically every 10 ratings)
   Suggestions appear after 10 rejected + 10 starred photos; stars after 30 starred photos.
 
@@ -298,21 +305,29 @@ Export from the shell:  lazyrate export ROOT DEST --rating 5   (repeatable; or -
 
 
 class SearchScreen(ModalScreen[str | None]):
-    """Text search over image content (CLIP). Returns the query; an empty query ends the search."""
+    """Search by place, coordinates or (with AI) content. Returns the query; an empty query ends the search."""
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Cancel"),
     ]
 
-    def __init__(self, *, current_query: str | None) -> None:
+    def __init__(self, *, current_query: str | None, is_text_search_available: bool) -> None:
         super().__init__()
         self._current_query = current_query
+        self._is_text_search_available = is_text_search_available
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog"):
-            yield Label("Search photos by content  [dim](e.g. beach sunset · receipt · dog in snow)[/]")
-            yield Input(value=self._current_query or "", placeholder="describe the photo…", id="search-query")
+            if self._is_text_search_available:
+                yield Label("Search photos  [dim](beach sunset · madeira · beach madeira · @32.75,-16.95 50km)[/]")
+                placeholder = "describe the photo, name a place, or give lat,lon and a radius…"
+            else:
+                yield Label("Search photos by place  [dim](madeira · funchal · portugal · @32.75,-16.95 50km)[/]")
+                placeholder = "town, region or country, or lat,lon and a radius…"
+            yield Input(value=self._current_query or "", placeholder=placeholder, id="search-query")
             yield Label("[dim]enter searches · empty query ends the search · esc cancels[/]")
+            if not self._is_text_search_available:
+                yield Label('[dim]searching by content ("beach sunset") needs the AI extra[/]')
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         self.dismiss(event.value.strip())

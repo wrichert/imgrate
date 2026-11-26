@@ -10,3 +10,4 @@ wheels/
 .venv
 
 .lazyrate.sqlite*
+.lazyrate-map.html

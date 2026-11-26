@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
-from PIL import Image, ImageStat
+from PIL import ExifTags, Image, ImageStat
 
 from lazyrate.media import scan_media_files
 from lazyrate.session import RatingSession
@@ -131,3 +131,48 @@ def mixed_root(tmp_path: Path) -> Path:
 @pytest.fixture
 def color_embedder() -> ColorEmbedder:
     return ColorEmbedder()
+
+
+GEOTAGGED_PHOTOS = {
+    # relative path: (latitude_deg, longitude_deg, colour); None = no GPS data
+    "madeira/funchal_1.jpg": (32.6657, -16.9255, (250, 250, 250)),
+    "madeira/funchal_2.jpg": (32.6500, -16.9100, (30, 160, 40)),
+    "madeira/north_coast.jpg": (32.8045, -16.8817, (200, 30, 30)),
+    "lisbon/belem.jpg": (38.6916, -9.2160, (40, 90, 200)),
+    "munich/marienplatz.jpg": (48.1374, 11.5755, (120, 120, 40)),
+    "misc/no_gps.jpg": None,
+    "misc/null_island.jpg": (0.0, 0.0, (10, 10, 10)),
+}
+
+
+def convert_to_degrees_minutes_seconds(value_deg: float) -> tuple[float, float, float]:
+    absolute_deg = abs(value_deg)
+    degrees = int(absolute_deg)
+    minutes = int((absolute_deg - degrees) * 60)
+    seconds = (absolute_deg - degrees - minutes / 60) * 3600
+    return (float(degrees), float(minutes), round(seconds, 4))
+
+
+def save_geotagged_photo(path: Path, *, latitude_deg: float, longitude_deg: float, color: tuple[int, int, int]) -> None:
+    exif = Image.Exif()
+    gps_tags = exif.get_ifd(ExifTags.IFD.GPSInfo)
+    gps_tags[ExifTags.GPS.GPSLatitudeRef] = "N" if latitude_deg >= 0 else "S"
+    gps_tags[ExifTags.GPS.GPSLatitude] = convert_to_degrees_minutes_seconds(latitude_deg)
+    gps_tags[ExifTags.GPS.GPSLongitudeRef] = "E" if longitude_deg >= 0 else "W"
+    gps_tags[ExifTags.GPS.GPSLongitude] = convert_to_degrees_minutes_seconds(longitude_deg)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (64, 48), color=color).save(path, format="JPEG", exif=exif)
+
+
+@pytest.fixture
+def geo_root(tmp_path: Path) -> Path:
+    root = tmp_path / "travels"
+    for relative_path, gps_data in GEOTAGGED_PHOTOS.items():
+        target_path = root / relative_path
+        if gps_data is None:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            Image.new("RGB", (64, 48), color=(90, 90, 90)).save(target_path, format="JPEG")
+            continue
+        latitude_deg, longitude_deg, color = gps_data
+        save_geotagged_photo(target_path, latitude_deg=latitude_deg, longitude_deg=longitude_deg, color=color)
+    return root

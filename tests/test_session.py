@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 import pytest
 
+from lazyrate.locations import LocationReader, PlaceIndex
 from lazyrate.media import scan_media_files
 from lazyrate.ratings import ALL_FILTER, REJECTED, UNRATED_FILTER, build_minimum_stars_filter
 from lazyrate.session import RatingSession, SortOrder
@@ -11,6 +13,7 @@ from lazyrate.session import RatingSession, SortOrder
 if TYPE_CHECKING:
     from pathlib import Path
 
+    from lazyrate.locations import PhotoLocation
     from lazyrate.store import RatingStore
 
 
@@ -169,3 +172,52 @@ def test_move_to_first_unrated_falls_back_to_first_file(session: RatingSession) 
     session.move_to_first_unrated()
 
     assert session.current_index == 0
+
+
+def build_located_session(geo_root: Path, store: RatingStore) -> RatingSession:
+    collected_locations: list[PhotoLocation] = []
+    scan_result = scan_media_files(geo_root)
+    LocationReader(root=geo_root, place_index=PlaceIndex()).read_locations(
+        scan_result.files,
+        on_batch=lambda locations, _done_count: collected_locations.extend(locations),
+        should_stop=lambda: False,
+    )
+    store.save_locations(collected_locations)
+    return RatingSession(scan_result=scan_result, store=store)
+
+
+def test_place_sort_groups_by_country_region_town_with_unlocated_last(geo_root: Path, store: RatingStore) -> None:
+    session = build_located_session(geo_root, store)
+
+    session.set_sort_order(SortOrder.PLACE)
+
+    assert SortOrder.PLACE in session.available_sort_orders
+    assert [section.label for section in session.sections] == [
+        "Germany › Bavaria › Munich",  # noqa: RUF001
+        "Portugal › Lisbon › Belém",  # noqa: RUF001
+        "Portugal › Madeira › Funchal",  # noqa: RUF001
+        "Portugal › Madeira › São Jorge",  # noqa: RUF001
+        "no location",
+    ]
+
+
+def test_changed_files_lose_their_stored_location(geo_root: Path, store: RatingStore) -> None:
+    build_located_session(geo_root, store)
+    os.utime(geo_root / "munich" / "marienplatz.jpg", (1_000_000, 1_000_000))
+
+    session = RatingSession(scan_result=scan_media_files(geo_root), store=store)
+
+    assert [media_file.relative_path for media_file in session.find_files_missing_locations()] == [
+        "munich/marienplatz.jpg"
+    ]
+
+
+def test_search_with_section_labels_lists_unmatched_photos_last(session: RatingSession) -> None:
+    session.set_search(
+        query="madeira",
+        scores={"2024/d.jpg": 0.0, "2023/a.jpg": -1.0},
+        section_labels={"2024/d.jpg": "Funchal", "2023/a.jpg": "Santana"},
+    )
+
+    assert [section.label for section in session.sections] == ["Funchal", "Santana", "other photos"]
+    assert session.visible_files[0].relative_path == "2024/d.jpg"

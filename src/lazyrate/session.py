@@ -10,6 +10,8 @@ from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from lazyrate.duplicates import DuplicateFinder, DuplicateGroup, HashedFile
+from lazyrate.geo_map import MapPoint
+from lazyrate.locations import NO_LOCATION_LABEL, find_files_missing_locations, normalize_place_name
 from lazyrate.media import IMAGE_EXTENSIONS, MediaFile, ScanResult, build_path_sort_key
 from lazyrate.ratings import ALL_FILTER, MAX_STARS, REJECTED, RatingBucket, RatingFilter, describe_bucket
 
@@ -18,6 +20,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from lazyrate.fingerprints import Fingerprint
+    from lazyrate.locations import PhotoLocation
     from lazyrate.store import RatingStore
     from lazyrate.suggestions import Suggestion
 
@@ -30,8 +33,10 @@ class SortOrder(StrEnum):
     """Unrated photos by the learned suggestion (best first, junk last); needs suggestions."""
     INFORMATIVE = "most informative"
     """Unrated photos the model is least sure about first: rating these teaches it the most."""
+    PLACE = "place"
+    """By country, region and town where the photo was taken (GPS); needs photos with GPS data."""
     RELEVANCE = "search"
-    """Best matches of the text search first; only while a search is active."""
+    """Best matches of the search first; only while a search is active."""
 
 
 BASIC_SORT_ORDERS = (SortOrder.RATING, SortOrder.DATE, SortOrder.PATH)
@@ -175,6 +180,7 @@ class RatingSession:
             saved_extensions if saved_extensions is not None else set(scan_result.extension_counts) & IMAGE_EXTENSIONS
         )
         self._fingerprints = self._select_current_fingerprints(store.load_fingerprints())
+        self._locations = self._select_current_locations(store.load_locations())
         self._duplicate_groups: list[DuplicateGroup] = []
         self._is_duplicates_mode = False
         self._rating_filter = ALL_FILTER
@@ -189,6 +195,8 @@ class RatingSession:
         """Snapshot used for ordering and section labels, so retraining never reshuffles the list mid-rating."""
         self._search_query: str | None = None
         self._search_scores: dict[str, float] = {}
+        self._search_section_labels: dict[str, str] = {}
+        """Section per scored file as given by the search (place, distance); empty: label by rank."""
         self._search_labels: dict[str, str] = {}
         self._sort_order_before_search = SortOrder.RATING
         self._view_version = 0
@@ -252,9 +260,20 @@ class RatingSession:
         return self._search_query
 
     @property
+    def locations(self) -> dict[str, PhotoLocation]:
+        """Up-to-date GPS data per relative path (also "no GPS" entries); copy."""
+        return dict(self._locations)
+
+    @property
+    def located_count(self) -> int:
+        return sum(1 for location in self._locations.values() if location.coordinates is not None)
+
+    @property
     def available_sort_orders(self) -> tuple[SortOrder, ...]:
         """What ``s`` cycles through: suggestion sorts once a model exists, search while one is active."""
         sort_orders = BASIC_SORT_ORDERS
+        if any(location.place is not None for location in self._locations.values()):
+            sort_orders += (SortOrder.PLACE,)
         if self._suggestions:
             sort_orders += SUGGESTION_SORT_ORDERS
         if self._search_query is not None:
@@ -368,6 +387,37 @@ class RatingSession:
 
     def save_setting(self, *, key: str, value: str) -> None:
         self._store.save_setting(key=key, value=value)
+
+    def get_location(self, media_file: MediaFile) -> PhotoLocation | None:
+        return self._locations.get(media_file.relative_path)
+
+    def collect_map_points(self) -> list[MapPoint]:
+        """Photos with GPS in the current view; while searching only the matches (not the "other photos")."""
+        map_points: list[MapPoint] = []
+        for media_file in self._visible_files:
+            if self._search_query is not None and media_file.relative_path not in self._search_scores:
+                continue
+            location = self._locations.get(media_file.relative_path)
+            if location is None or location.coordinates is None:
+                continue
+            map_points.append(
+                MapPoint(
+                    relative_path=media_file.relative_path,
+                    coordinates=location.coordinates,
+                    rating=self.get_rating(media_file),
+                    place=location.place,
+                )
+            )
+        return map_points
+
+    def find_files_missing_locations(self) -> list[MediaFile]:
+        """Image files whose GPS data was not read yet (or changed since)."""
+        return find_files_missing_locations(files=self._scan_result.files, locations=self._locations)
+
+    def add_locations(self, locations: Iterable[PhotoLocation]) -> None:
+        """Register freshly read GPS data; the place sort follows on the next rebuild, like re-ratings."""
+        for location in locations:
+            self._locations[location.relative_path] = location
 
     def find_files_missing_fingerprints(self) -> list[MediaFile]:
         """Image files (any enabled state) without an up-to-date fingerprint."""
@@ -508,12 +558,16 @@ class RatingSession:
         if not self._suggestions and self._sort_order in SUGGESTION_SORT_ORDERS:
             self.set_sort_order(SortOrder.RATING)
 
-    def set_search(self, *, query: str, scores: dict[str, float]) -> None:
-        """Show the best matches of ``query`` first (scores: similarity per relative path)."""
+    def set_search(self, *, query: str, scores: dict[str, float], section_labels: dict[str, str] | None = None) -> None:
+        """Show the best matches of ``query`` first (higher score first; files without a score last).
+
+        ``section_labels`` names each scored file's section (town, distance band); without, sections are rank bands.
+        """
         if self._sort_order is not SortOrder.RELEVANCE:
             self._sort_order_before_search = self._sort_order
         self._search_query = query
         self._search_scores = dict(scores)
+        self._search_section_labels = dict(section_labels or {})
         self._sort_order = SortOrder.RELEVANCE
         self._rebuild_visible_files()
         self._current_index = 0
@@ -523,6 +577,7 @@ class RatingSession:
             return
         self._search_query = None
         self._search_scores = {}
+        self._search_section_labels = {}
         self.set_sort_order(self._sort_order_before_search)
 
     def set_duplicates_mode(self, *, is_duplicates_mode: bool) -> None:
@@ -539,6 +594,7 @@ class RatingSession:
             raise ValueError(f"Rescan root {scan_result.root} differs from {self._scan_result.root}")
         self._scan_result = scan_result
         self._fingerprints = self._select_current_fingerprints(self._fingerprints)
+        self._locations = self._select_current_locations(self._locations)
         self.rebuild_duplicate_groups()
         self._rebuild_visible_files()
 
@@ -582,6 +638,17 @@ class RatingSession:
             return
         self._undo_stack.append(changes)
         del self._undo_stack[: -self.MAX_UNDO_DEPTH]
+
+    def _select_current_locations(self, locations: dict[str, PhotoLocation]) -> dict[str, PhotoLocation]:
+        """Drop GPS data of files that vanished or changed since it was read."""
+        files_by_path = {media_file.relative_path: media_file for media_file in self._scan_result.files}
+        return {
+            relative_path: location
+            for relative_path, location in locations.items()
+            if (media_file := files_by_path.get(relative_path)) is not None
+            and location.size_bytes == media_file.size_bytes
+            and location.modified_timestamp_utc == media_file.modified_timestamp_utc
+        }
 
     def _select_current_fingerprints(self, fingerprints: dict[str, Fingerprint]) -> dict[str, Fingerprint]:
         """Drop fingerprints of files that vanished or changed since they were computed."""
@@ -636,11 +703,12 @@ class RatingSession:
         elif self._sort_order is SortOrder.INFORMATIVE:
             matching_files.sort(key=self._build_informative_sort_key)
             build_label = self._format_informative_label
+        elif self._sort_order is SortOrder.PLACE:
+            matching_files.sort(key=self._build_place_sort_key)
+            build_label = self._format_place_label
         elif self._sort_order is SortOrder.RELEVANCE:
-            matching_files.sort(key=lambda media_file: -self._search_scores.get(media_file.relative_path, -2.0))
-            self._search_labels = {
-                media_file.relative_path: describe_search_rank(rank) for rank, media_file in enumerate(matching_files)
-            }
+            matching_files.sort(key=self._build_search_sort_key)
+            self._search_labels = self._build_search_labels(matching_files)
             build_label = self._format_search_label
         else:
             build_label = format_folder_label
@@ -710,6 +778,41 @@ class RatingSession:
             return (2, 0.0)
         suggestion = self._view_suggestions.get(media_file.relative_path)
         return (1, 0.0) if suggestion is None else (0, -suggestion.uncertainty)
+
+    def _build_search_sort_key(self, media_file: MediaFile) -> tuple[bool, float]:
+        score = self._search_scores.get(media_file.relative_path)
+        return (score is None, 0.0 if score is None else -score)
+
+    def _build_search_labels(self, sorted_files: list[MediaFile]) -> dict[str, str]:
+        """Scored files: the label the search gave, else their rank band; unscored files are "other photos"."""
+        search_labels: dict[str, str] = {}
+        for rank, media_file in enumerate(sorted_files):
+            relative_path = media_file.relative_path
+            if relative_path not in self._search_scores:
+                break
+            if self._search_section_labels:
+                search_labels[relative_path] = self._search_section_labels.get(
+                    relative_path, OTHER_SEARCH_RESULTS_LABEL
+                )
+            else:
+                search_labels[relative_path] = describe_search_rank(rank)
+        return search_labels
+
+    def _build_place_sort_key(self, media_file: MediaFile) -> tuple[bool, str, str, str, float]:
+        """Country, region, town (case- and accent-insensitive), then capture time; photos without GPS last."""
+        location = self._locations.get(media_file.relative_path)
+        if location is None or location.place is None:
+            return (True, "", "", "", self._compute_sort_timestamp(media_file))
+        country, region, town = (
+            normalize_place_name(name) for name in (location.place.country, location.place.region, location.place.town)
+        )
+        return (False, country, region, town, self._compute_sort_timestamp(media_file))
+
+    def _format_place_label(self, media_file: MediaFile) -> str:
+        location = self._locations.get(media_file.relative_path)
+        if location is None or location.place is None:
+            return NO_LOCATION_LABEL
+        return location.place.path_label
 
     def _format_search_label(self, media_file: MediaFile) -> str:
         return self._search_labels.get(media_file.relative_path, OTHER_SEARCH_RESULTS_LABEL)

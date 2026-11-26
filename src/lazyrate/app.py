@@ -12,6 +12,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from typing import TYPE_CHECKING, ClassVar
 
 from rich.text import Text
@@ -25,6 +26,15 @@ from textual_image.widget import get_cell_size
 
 from lazyrate.export import ExportOptions, ExportSummary, export_files
 from lazyrate.fingerprints import Fingerprint, compute_image_signature
+from lazyrate.geo_map import BROWSER_MAP_FILE_NAME, Basemap, BrowserMapWriter, build_town_labels
+from lazyrate.geo_search import (
+    SearchResult,
+    find_place_match,
+    parse_radius_query,
+    rank_within_place,
+    search_by_place,
+    search_by_radius,
+)
 from lazyrate.grid_layout import (
     GridPage,
     GridRow,
@@ -39,6 +49,7 @@ from lazyrate.learning import (
     find_files_missing_embeddings,
     train_and_predict,
 )
+from lazyrate.locations import LocationReader, PlaceIndex
 from lazyrate.media import scan_media_files
 from lazyrate.preview import PreviewCache
 from lazyrate.ratings import ALL_BUCKETS, FILTER_PRESETS, MAX_STARS, REJECTED, describe_bucket, format_stars
@@ -58,13 +69,17 @@ if TYPE_CHECKING:
     from collections.abc import Callable
     from pathlib import Path
 
+    from PIL import Image
     from textual.binding import BindingType
     from textual.geometry import Size
     from textual.timer import Timer
     from textual.widget import Widget
 
     from lazyrate.embeddings import EmbeddingMatrix, ImageEmbedder
+    from lazyrate.geo_map import MapPoint, RenderedMap
+    from lazyrate.geo_search import PlaceMatch
     from lazyrate.learning import LearningResult
+    from lazyrate.locations import GeoCoordinates, PhotoLocation
     from lazyrate.media import MediaFile, ScanResult
     from lazyrate.preview import Preview
     from lazyrate.ratings import RatingFilter
@@ -171,6 +186,27 @@ def build_suggestion_text(suggestion: Suggestion) -> Text:
     return Text(f"{'★' * suggested_rating}?{confidence_text}", style="italic dim yellow")
 
 
+class SidePaneMode(StrEnum):
+    """What the right pane shows besides the metadata (persisted per database)."""
+
+    INFO = "info"
+    PREVIEW = "preview"
+    """Large preview of the highlighted image (grid view only)."""
+    MAP = "map"
+    """Offline map of the photos in the view (or the search matches), the current one marked."""
+
+
+@dataclass(frozen=True, slots=True)
+class SideMapKey:
+    """Everything the base map depends on; while it is unchanged only the current-photo marker is redrawn."""
+
+    view_version: int
+    search_query: str | None
+    located_count: int
+    width_px: int
+    height_px: int
+
+
 class TaskProgressRow(Horizontal):
     """One running background task: title plus progress bar (indeterminate while ``total`` is None)."""
 
@@ -184,12 +220,13 @@ class TaskProgressRow(Horizontal):
         yield ProgressBar(total=self._total, show_eta=True, classes="progress-bar")
 
     def set_progress(self, *, done_count: int, total_count: int) -> None:
-        if not self.is_attached:
+        # A fast task can report before the row's children are composed: skip that update, the next one lands.
+        title_label = next(iter(self.query(".progress-title").results(Label)), None)
+        progress_bar = next(iter(self.query(ProgressBar)), None)
+        if title_label is None or progress_bar is None:
             return
-        next(iter(self.query(".progress-title").results(Label))).update(
-            f"{self._title}  {done_count:,}/{total_count:,}"
-        )
-        next(iter(self.query(ProgressBar))).update(total=total_count, progress=done_count)
+        title_label.update(f"{self._title}  {done_count:,}/{total_count:,}")
+        progress_bar.update(total=total_count, progress=done_count)
 
 
 class SectionHeader(Static):
@@ -232,8 +269,6 @@ class ImageRaterApp(App[None]):
     DEFAULT_SORT_ORDER = SortOrder.RATING
     EXPORT_OPTIONS_SETTING_KEY = "export_options"
     SIDE_PANE_SETTING_KEY = "side_pane"
-    SIDE_PANE_PREVIEW = "preview"
-    SIDE_PANE_INFO = "info"
     SECTION_LIST_MAX_LINES = 9
     SECTION_LABEL_WIDTH = 20
     PREVIEW_EDGE_STEP_PX = 256
@@ -334,7 +369,9 @@ class ImageRaterApp(App[None]):
         Binding("e", "choose_extensions", "Formats"),
         Binding("o", "open_external", "Open ext"),
         Binding("c", "copy_path", "Copy path"),
-        Binding("p", "toggle_side_preview", "Big preview"),
+        Binding("p", "toggle_side_pane('preview')", "Big preview"),
+        Binding("m", "toggle_side_pane('map')", "Map"),
+        Binding("M", "open_browser_map", "Browser map", show=False),
         Binding("a", "toggle_auto_advance", "Auto-adv", show=False),
         Binding("r", "rescan", "Rescan", show=False),
         Binding("question_mark", "help", "Help"),
@@ -362,10 +399,14 @@ class ImageRaterApp(App[None]):
         self._progress_rows: dict[str, TaskProgressRow] = {}
         self._indexing_progress: IndexingProgress | None = None
         self._preview_cache = PreviewCache()
+        self._place_index = PlaceIndex()
         self._is_auto_advance = True
         self._is_grid_mode = True
         self._is_full_view = False
-        self._is_side_preview_enabled = False
+        self._side_pane_mode = SidePaneMode.INFO
+        self._basemap = Basemap()
+        self._side_map_key: SideMapKey | None = None
+        self._side_map_base: RenderedMap | None = None
         self._grid_layout_key: GridLayoutKey | None = None
         self._grid_rows: list[GridRow] = []
         self._grid_pages: list[GridPage] = []
@@ -393,10 +434,13 @@ class ImageRaterApp(App[None]):
     def on_mount(self) -> None:
         self._session.set_sort_order(self.DEFAULT_SORT_ORDER)
         self._session.move_to_first_unrated()
-        self._is_side_preview_enabled = self._session.load_setting(self.SIDE_PANE_SETTING_KEY) == self.SIDE_PANE_PREVIEW
+        saved_side_pane_mode = self._session.load_setting(self.SIDE_PANE_SETTING_KEY)
+        if saved_side_pane_mode in set(SidePaneMode):
+            self._side_pane_mode = SidePaneMode(saved_side_pane_mode)
         self._apply_view_mode()
         self._refresh_all()
         self._start_fingerprint_indexing()
+        self._start_location_reading()
         self._start_learning_pipeline()
 
     def on_unmount(self) -> None:
@@ -520,16 +564,33 @@ class ImageRaterApp(App[None]):
             self._handle_extensions_chosen,
         )
 
-    def action_toggle_side_preview(self) -> None:
-        self._is_side_preview_enabled = not self._is_side_preview_enabled
-        self._session.save_setting(
-            key=self.SIDE_PANE_SETTING_KEY,
-            value=self.SIDE_PANE_PREVIEW if self._is_side_preview_enabled else self.SIDE_PANE_INFO,
-        )
-        if self._is_side_preview_enabled and not self._is_grid_mode:
+    def action_toggle_side_pane(self, mode_name: str) -> None:
+        """``p``: large preview <-> metadata; ``m``: map <-> metadata."""
+        requested_mode = SidePaneMode(mode_name)
+        self._side_pane_mode = SidePaneMode.INFO if self._side_pane_mode is requested_mode else requested_mode
+        self._session.save_setting(key=self.SIDE_PANE_SETTING_KEY, value=self._side_pane_mode.value)
+        if self._side_pane_mode is SidePaneMode.PREVIEW and not self._is_grid_mode:
             self.notify("The large preview in the right pane is shown in grid view (g)", timeout=3)
+        if self._side_pane_mode is SidePaneMode.MAP and self._session.located_count == 0:
+            self.notify("No photo here has GPS data (yet) — the map stays empty", timeout=4)
         self._apply_view_mode()
         self.call_after_refresh(self._refresh_all)
+
+    def action_open_browser_map(self) -> None:
+        """Write the photos of the view (or the search matches) to an HTML map and open it in the browser."""
+        map_points = self._session.collect_map_points()
+        if not map_points:
+            self.notify("No photos with GPS data in this view", timeout=3)
+            return
+        output_path = self._database_path.parent / BROWSER_MAP_FILE_NAME
+        title = f"{self._session.search_query or self._session.rating_filter.name} · {len(map_points):,} photos"
+        self._start_progress("browser-map", title="Building map", total=len(map_points))
+        self.run_worker(
+            functools.partial(self._write_browser_map, map_points, output_path, title),
+            thread=True,
+            exclusive=True,
+            group="browser-map",
+        )
 
     def action_toggle_grid(self) -> None:
         self._is_grid_mode = not self._is_grid_mode
@@ -593,10 +654,10 @@ class ImageRaterApp(App[None]):
         self.action_keep_best_of_group()
 
     def action_search(self) -> None:
-        if self._embedder is None or self._embedding_matrix is None:
-            self.notify(self._describe_ai_unavailable(), timeout=5)
-            return
-        self.push_screen(SearchScreen(current_query=self._session.search_query), self._handle_search_query)
+        self.push_screen(
+            SearchScreen(current_query=self._session.search_query, is_text_search_available=self._is_ai_search_ready),
+            self._handle_search_query,
+        )
 
     def action_retrain(self) -> None:
         if self._embedding_matrix is None:
@@ -611,15 +672,7 @@ class ImageRaterApp(App[None]):
         current_file = self._session.current_file
         if current_file is None:
             return
-        opener_command = "open" if sys.platform == "darwin" else "xdg-open"
-        try:
-            subprocess.Popen(
-                [opener_command, str(self._session.resolve_path(current_file))],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except OSError as error:
-            self.notify(f"Cannot open: {error}", severity="error", markup=False)
+        self._open_with_default_app(self._session.resolve_path(current_file))
 
     def action_copy_path(self) -> None:
         """Copy the absolute path via the system clipboard tool; OSC 52 (terminal clipboard) as a fallback."""
@@ -673,26 +726,68 @@ class ImageRaterApp(App[None]):
     # ---------------------------------------------------------------- handlers
 
     def _handle_search_query(self, query: str | None) -> None:
+        """Coordinates -> radius search; a known place name -> place search (plus text ranking); else text search."""
         if query is None:
             return
         if not query:
             self._session.clear_search()
             self._refresh_all()
             return
+        try:
+            radius_query = parse_radius_query(query)
+        except ValueError as error:
+            self.notify(str(error), severity="warning", markup=False)
+            return
+        locations = self._session.locations
+        if radius_query is not None:
+            self._apply_search_result(query, search_by_radius(query=radius_query, locations=locations.values()))
+            return
+        place_match = find_place_match(query_text=query, locations=locations)
+        if place_match is not None and (not place_match.remaining_text or not self._is_ai_search_ready):
+            if place_match.remaining_text:
+                self.notify(f"Text search needs AI; ignoring '{place_match.remaining_text}'", timeout=4, markup=False)
+            self._apply_search_result(query, search_by_place(match=place_match, locations=locations))
+            return
+        if not self._is_ai_search_ready:
+            self.notify(self._describe_unmatched_search(query), timeout=6, markup=False)
+            return
+        text_query = query if place_match is None else place_match.remaining_text
         self._start_progress("search", title=f"Searching: {query}", total=None)
-        self.run_worker(functools.partial(self._run_search, query), thread=True, exclusive=True, group="search")
+        self.run_worker(
+            functools.partial(self._run_text_search, query, text_query, place_match),
+            thread=True,
+            exclusive=True,
+            group="search",
+        )
 
-    def _run_search(self, query: str) -> None:
+    def _run_text_search(self, query: str, text_query: str, place_match: PlaceMatch | None) -> None:
         if self._embedder is None or self._embedding_matrix is None:
             return
-        scores = self._embedding_matrix.rank_by_similarity(self._embedder.embed_text(query))
-        self.call_from_thread(self._handle_search_done, query, scores)
+        text_scores = self._embedding_matrix.rank_by_similarity(self._embedder.embed_text(text_query))
+        if place_match is None:
+            result = SearchResult(scores=text_scores, section_labels={}, summary="Best matches first")
+        else:
+            result = rank_within_place(match=place_match, text_scores=text_scores)
+        self.call_from_thread(self._handle_text_search_done, query, result)
 
-    def _handle_search_done(self, query: str, scores: dict[str, float]) -> None:
+    def _handle_text_search_done(self, query: str, result: SearchResult) -> None:
         self._finish_progress("search")
-        self._session.set_search(query=query, scores=scores)
-        self.notify("Best matches first · esc ends the search", timeout=3)
+        self._apply_search_result(query, result)
+
+    def _apply_search_result(self, query: str, result: SearchResult) -> None:
+        if not result.scores:
+            self.notify(f"No matches: {result.summary}", severity="warning", timeout=4, markup=False)
+            return
+        self._session.set_search(query=query, scores=result.scores, section_labels=result.section_labels)
+        self.notify(f"{result.summary} · esc ends the search", timeout=4, markup=False)
         self._refresh_all()
+
+    def _describe_unmatched_search(self, query: str) -> str:
+        if self._session.located_count == 0:
+            location_hint = "no photo here has GPS data"
+        else:
+            location_hint = f"no photo was taken in a town, region or country called '{query}'"
+        return f"{location_hint}; searching by content needs AI ({self._describe_ai_unavailable()})"
 
     def _handle_filter_chosen(self, rating_filter: RatingFilter | None) -> None:
         if rating_filter is not None:
@@ -761,6 +856,7 @@ class ImageRaterApp(App[None]):
         self.notify(f"Found {len(scan_result.files):,} media files")
         self._refresh_all()
         self._start_fingerprint_indexing()
+        self._start_location_reading()
         self._start_learning_pipeline()
 
     # ------------------------------------------------------ fingerprint index
@@ -831,6 +927,52 @@ class ImageRaterApp(App[None]):
             self._refresh_all()
         else:
             self._refresh_sidebar()
+
+    # ------------------------------------------------------- GPS locations
+
+    def _start_location_reading(self) -> None:
+        pending_files = self._session.find_files_missing_locations()
+        if not pending_files:
+            return
+        self._start_progress("locations", title="Reading GPS locations", total=len(pending_files))
+        self.run_worker(
+            functools.partial(self._read_locations, pending_files),
+            thread=True,
+            exclusive=True,
+            group="locations",
+        )
+
+    def _read_locations(self, pending_files: list[MediaFile]) -> None:
+        """Runs in a worker thread with its own SQLite connection."""
+        worker = get_current_worker()
+        store = RatingStore(self._database_path)
+        reader = LocationReader(root=self._session.root, place_index=self._place_index)
+        try:
+            reader.read_locations(
+                pending_files,
+                on_batch=functools.partial(self._save_location_batch, store, len(pending_files)),
+                should_stop=lambda: worker.is_cancelled,
+            )
+        finally:
+            store.close()
+        if not worker.is_cancelled:
+            self.call_from_thread(self._handle_locations_done)
+
+    def _save_location_batch(
+        self, store: RatingStore, total_count: int, locations: list[PhotoLocation], done_count: int
+    ) -> None:
+        store.save_locations(locations)
+        self.call_from_thread(self._handle_locations_read, locations, done_count, total_count)
+
+    def _handle_locations_read(self, locations: list[PhotoLocation], done_count: int, total_count: int) -> None:
+        self._session.add_locations(locations)
+        self._update_progress("locations", done_count=done_count, total_count=total_count)
+
+    def _handle_locations_done(self) -> None:
+        self._finish_progress("locations")
+        self._refresh_sidebar()
+        if self._is_side_map_shown:
+            self._show_side_map()
 
     # ---------------------------------------------------- suggestions (AI)
 
@@ -1009,19 +1151,28 @@ class ImageRaterApp(App[None]):
     @property
     def _is_side_preview_shown(self) -> bool:
         """In single view the main area already shows the image large, so the pane keeps the metadata."""
-        return self._is_side_preview_enabled and self._is_grid_shown
+        return self._side_pane_mode is SidePaneMode.PREVIEW and self._is_grid_shown
+
+    @property
+    def _is_side_map_shown(self) -> bool:
+        return self._side_pane_mode is SidePaneMode.MAP and not self._is_full_view
 
     @property
     def _is_grid_shown(self) -> bool:
         """Full view temporarily replaces the grid; ``_is_grid_mode`` remembers where to return to."""
         return self._is_grid_mode and not self._is_full_view
 
+    @property
+    def _is_ai_search_ready(self) -> bool:
+        """Searching by content needs the CLIP model and every photo described once."""
+        return self._embedder is not None and self._embedding_matrix is not None
+
     def _apply_view_mode(self) -> None:
         self.query_one("#viewer").display = not self._is_grid_shown
         self.query_one("#grid").display = self._is_grid_shown
         self.query_one("#sidebar").display = not self._is_full_view
         self.query_one(Footer).display = not self._is_full_view
-        self.query_one("#sidebar").set_class(self._is_side_preview_shown, "-preview")
+        self.query_one("#sidebar").set_class(self._is_side_preview_shown or self._is_side_map_shown, "-preview")
 
     def _move_to_next_unrated(self) -> None:
         if not self._session.move_to_next_unrated():
@@ -1057,6 +1208,8 @@ class ImageRaterApp(App[None]):
             self.run_worker(self._show_current_preview(), exclusive=True, group="preview")
         if self._is_side_preview_shown:
             self.run_worker(self._show_side_preview(), exclusive=True, group="side-preview")
+        if self._is_side_map_shown:
+            self._show_side_map()
         self._refresh_sidebar()
         self._refresh_statusbar()
 
@@ -1124,6 +1277,11 @@ class ImageRaterApp(App[None]):
         else:
             modified_at = datetime.fromtimestamp(current_file.modified_timestamp_utc).astimezone()
             info_text.append(f"\nmodified {modified_at:%Y-%m-%d %H:%M}", style="dim")
+        location = self._session.get_location(current_file)
+        if location is not None and location.place is not None and location.coordinates is not None:
+            place = location.place
+            info_text.append(f"\n{', '.join(name for name in (place.town, place.region, place.country) if name)}")
+            info_text.append(f"\n{location.coordinates}", style="dim")
         return info_text
 
     def _build_sections_text(self) -> Text:
@@ -1264,6 +1422,8 @@ class ImageRaterApp(App[None]):
         preview = await self._preview_cache.get(self._session.resolve_path(current_file), max_edge_px=max_edge_px)
         if self._session.current_file != current_file or not image_widget.is_attached:
             return
+        if not self._is_side_preview_shown:  # switched to the map while decoding
+            return
         if preview.image is None:
             image_widget.image = None
             return
@@ -1279,6 +1439,104 @@ class ImageRaterApp(App[None]):
         image_widget.styles.width = cell_box.columns
         image_widget.styles.height = cell_box.rows
         image_widget.image = preview.image
+
+    def _show_side_map(self) -> None:
+        """Render the map pane in a thread; the base map is cached until the view, search or pane size changes."""
+        box_size = self.query_one("#side-preview").content_size
+        if box_size.width == 0 or box_size.height == 0:
+            return
+        cell_size = get_cell_size()
+        map_key = SideMapKey(
+            view_version=self._session.view_version,
+            search_query=self._session.search_query,
+            located_count=self._session.located_count,
+            width_px=box_size.width * cell_size.width,
+            height_px=box_size.height * cell_size.height,
+        )
+        current_file = self._session.current_file
+        current_location = None if current_file is None else self._session.get_location(current_file)
+        highlighted = None if current_location is None else current_location.coordinates
+        # Collected here, on the UI thread: the worker must not read session state that rating may change.
+        map_points = None if map_key == self._side_map_key else self._session.collect_map_points()
+        self.run_worker(
+            functools.partial(self._render_side_map, map_key, map_points, highlighted, box_size),
+            thread=True,
+            exclusive=True,
+            group="side-map",
+        )
+
+    def _render_side_map(
+        self,
+        map_key: SideMapKey,
+        map_points: list[MapPoint] | None,
+        highlighted: GeoCoordinates | None,
+        box_size: Size,
+    ) -> None:
+        """``map_points`` is ``None`` when the cached base map still fits ``map_key``."""
+        base_map = self._side_map_base
+        if map_points is not None or base_map is None:
+            map_points = map_points or []
+            if not map_points and highlighted is not None:
+                framed_points = [highlighted]
+            else:
+                framed_points = [point.coordinates for point in map_points]
+            base_map = self._basemap.render_base(
+                points=framed_points,
+                labels=build_town_labels(map_points),
+                width_px=map_key.width_px,
+                height_px=map_key.height_px,
+            )
+            self._side_map_key = map_key
+            self._side_map_base = base_map
+        if get_current_worker().is_cancelled:
+            return
+        map_image = self._basemap.draw_highlight(base_map, highlighted=highlighted)
+        self.call_from_thread(self._display_side_map, map_image, box_size)
+
+    def _open_with_default_app(self, path: Path) -> None:
+        opener_command = "open" if sys.platform == "darwin" else "xdg-open"
+        try:
+            subprocess.Popen([opener_command, str(path)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as error:
+            self.notify(f"Cannot open: {error}", severity="error", markup=False)
+
+    def _display_side_map(self, map_image: Image.Image, box_size: Size) -> None:
+        image_widget = next(iter(self.query("#side-preview-image").results(ImageWidget)), None)
+        if image_widget is None or not self._is_side_map_shown:
+            return
+        image_widget.styles.width = box_size.width
+        image_widget.styles.height = box_size.height
+        image_widget.image = map_image
+
+    def _write_browser_map(self, map_points: list[MapPoint], output_path: Path, title: str) -> None:
+        worker = get_current_worker()
+        try:
+            is_written = BrowserMapWriter(root=self._session.root).write(
+                map_points,
+                output_path=output_path,
+                title=title,
+                on_progress=functools.partial(self._report_progress_from_thread, "browser-map"),
+                should_stop=lambda: worker.is_cancelled,
+            )
+        except OSError as error:
+            self.call_from_thread(self._handle_browser_map_failed, str(error))
+            return
+        if is_written:
+            self.call_from_thread(self._handle_browser_map_written, output_path, len(map_points))
+
+    def _handle_browser_map_written(self, output_path: Path, point_count: int) -> None:
+        self._finish_progress("browser-map")
+        self._open_with_default_app(output_path)
+        self.notify(
+            f"Map of {point_count:,} photos opened in the browser ({shorten_home_path(output_path)}). "
+            "Map tiles load from OpenStreetMap / Esri; photos stay on this computer.",
+            timeout=6,
+            markup=False,
+        )
+
+    def _handle_browser_map_failed(self, error_text: str) -> None:
+        self._finish_progress("browser-map")
+        self.notify(f"Cannot write the map: {error_text}", severity="error", markup=False)
 
     def _display_preview(self, preview: Preview) -> None:
         preview_widget = self.query_one("#preview", ImageWidget)
@@ -1399,8 +1657,11 @@ class ImageRaterApp(App[None]):
         visible_files = self._session.visible_files
         cell_columns = max(1, grid.content_size.width // max(1, self._grid_layout_key.column_count) - 2)
         cell_rows = self.THUMBNAIL_HEIGHT_CELLS - 3  # border + rating line
+        current_sections = set(self._session.sections)
         for header in grid.query(SectionHeader):
-            header.update(self._build_section_header_text(header.row))
+            # A header can outlive a re-sort until the grid is laid out again; that re-layout redraws it.
+            if header.row.section in current_sections:
+                header.update(self._build_section_header_text(header.row))
         suggested_best_indices = self._find_suggested_best_indices_on_page()
         for cell in grid.query(ThumbnailCell):
             if cell.file_index is None or cell.file_index >= len(visible_files):

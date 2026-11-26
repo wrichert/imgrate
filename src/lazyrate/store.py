@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -11,6 +12,7 @@ import numpy as np
 
 from lazyrate.embeddings import StoredEmbedding
 from lazyrate.fingerprints import Fingerprint
+from lazyrate.locations import GeoCoordinates, PhotoLocation, Place
 from lazyrate.ratings import MAX_STARS, REJECTED
 
 if TYPE_CHECKING:
@@ -55,6 +57,18 @@ def migrate_legacy_database(root: Path) -> None:
             legacy_file.rename(root / (RatingStore.DEFAULT_FILE_NAME + suffix))
 
 
+def build_photo_location(row: tuple) -> PhotoLocation:
+    relative_path, size_bytes, modified_timestamp_utc, latitude_deg, longitude_deg, town, region, country = row
+    has_coordinates = latitude_deg is not None and longitude_deg is not None
+    return PhotoLocation(
+        relative_path=relative_path,
+        size_bytes=size_bytes,
+        modified_timestamp_utc=modified_timestamp_utc,
+        coordinates=GeoCoordinates(latitude_deg=latitude_deg, longitude_deg=longitude_deg) if has_coordinates else None,
+        place=Place(town=town or "", region=region or "", country=country or "") if has_coordinates else None,
+    )
+
+
 class RatingStore:
     """Ratings keyed by path relative to the photo root, so the folder can be moved.
 
@@ -63,6 +77,8 @@ class RatingStore:
 
     DEFAULT_FILE_NAME = ".lazyrate.sqlite"
     _ENABLED_EXTENSIONS_KEY = "enabled_extensions"
+    _WAL_SWITCH_ATTEMPTS = 50
+    _WAL_SWITCH_RETRY_DELAY_SECONDS = 0.05
     _SCHEMA = """
         CREATE TABLE IF NOT EXISTS ratings (
             relative_path TEXT PRIMARY KEY,
@@ -84,6 +100,16 @@ class RatingStore:
             vector BLOB NOT NULL,
             PRIMARY KEY (relative_path, model_name)
         );
+        CREATE TABLE IF NOT EXISTS locations (
+            relative_path TEXT PRIMARY KEY,
+            size_bytes INTEGER NOT NULL,
+            modified_timestamp_utc REAL NOT NULL,
+            latitude_deg REAL,
+            longitude_deg REAL,
+            town TEXT,
+            region TEXT,
+            country TEXT
+        );
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
@@ -92,9 +118,9 @@ class RatingStore:
 
     def __init__(self, database_path: Path) -> None:
         self._database_path = database_path
-        # timeout: the background fingerprint indexer writes through its own connection.
+        # timeout: the background indexers (fingerprints, GPS, embeddings) write through their own connections.
         self._connection = sqlite3.connect(database_path, timeout=10)
-        self._connection.execute("PRAGMA journal_mode=WAL")
+        self._switch_to_write_ahead_log()
         self._connection.execute("PRAGMA synchronous=NORMAL")
         self._connection.executescript(self._SCHEMA)
         self._connection.commit()
@@ -208,6 +234,34 @@ class RatingStore:
         )
         self._connection.commit()
 
+    def load_locations(self) -> dict[str, PhotoLocation]:
+        """GPS position and nearest town per file; rows without coordinates mark files that have no GPS data."""
+        rows = self._connection.execute(
+            "SELECT relative_path, size_bytes, modified_timestamp_utc, latitude_deg, longitude_deg, town, region, "
+            "country FROM locations"
+        ).fetchall()
+        return {row[0]: build_photo_location(row) for row in rows}
+
+    def save_locations(self, locations: Iterable[PhotoLocation]) -> None:
+        self._connection.executemany(
+            "INSERT OR REPLACE INTO locations (relative_path, size_bytes, modified_timestamp_utc, latitude_deg, "
+            "longitude_deg, town, region, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (
+                    location.relative_path,
+                    location.size_bytes,
+                    location.modified_timestamp_utc,
+                    None if location.coordinates is None else location.coordinates.latitude_deg,
+                    None if location.coordinates is None else location.coordinates.longitude_deg,
+                    None if location.place is None else location.place.town,
+                    None if location.place is None else location.place.region,
+                    None if location.place is None else location.place.country,
+                )
+                for location in locations
+            ],
+        )
+        self._connection.commit()
+
     def load_setting(self, key: str) -> str | None:
         row = self._connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
         return None if row is None else row[0]
@@ -221,3 +275,16 @@ class RatingStore:
 
     def close(self) -> None:
         self._connection.close()
+
+    def _switch_to_write_ahead_log(self) -> None:
+        """WAL mode is stored in the file, so usually only a new database switches. Switching ignores the busy
+        timeout and fails with "database is locked" while another connection (a background indexer opening the
+        same new file) is busy, hence the retries."""
+        for _ in range(self._WAL_SWITCH_ATTEMPTS):
+            try:
+                if self._connection.execute("PRAGMA journal_mode").fetchone()[0] == "wal":
+                    return
+                self._connection.execute("PRAGMA journal_mode=WAL")
+            except sqlite3.OperationalError:
+                time.sleep(self._WAL_SWITCH_RETRY_DELAY_SECONDS)
+        self._connection.execute("PRAGMA journal_mode=WAL")

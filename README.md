@@ -26,6 +26,10 @@ terminals with a graphics protocol (Ghostty, Kitty, WezTerm, iTerm2) they are sh
 | **Clean up a phone camera roll** | grouping bursts and near duplicates (`b` keeps one), AI flags screenshots, receipts and pocket shots as junk, `Y` rejects them in one go |
 | **Curate a trip album or slideshow** | sort by date taken, rate, export ≥ ★★★★ by copy or symlink, flat or with folders |
 | **Find that one photo** | AI text search: `/` → "dog in snow" |
+| **Show all photos from one trip or place** | GPS search, works without AI: `/` → "madeira", "lisbon", "portugal", or `@32.75,-16.95 50km`; one section per town |
+| **Find "that beach on Madeira"** | place + AI text combined: `/` → "beach madeira" (only Madeira photos, best beach matches first) |
+| **Browse the archive by where, not when** | sort **place**: sections per country › region › town |
+| **See where the photos of a trip (or a search) were taken** | `m`: offline map in the right pane, current photo marked; `M`: zoomable map in the browser with thumbnails |
 | **Keep up with new photos** | ratings stay with the folder; rescan, only new photos are unrated, the AI already knows your taste |
 
 lazyrate never deletes or modifies photos. Rejected photos are just marked; to clean up, export them
@@ -36,7 +40,7 @@ lazyrate never deletes or modifies photos. Rejected photos are just marked; to c
 ```mermaid
 flowchart TD
     folder["Photo folder<br/>thousands of photos"] --> start["lazyrate ~/Pictures/2025"]
-    start -. "background, once per photo" .-> index["Duplicate fingerprints<br/>+ AI image descriptions (optional)"]
+    start -. "background, once per photo" .-> index["Duplicate fingerprints · GPS places<br/>+ AI image descriptions (optional)"]
     start --> dupes["1 · Clear out bursts<br/>d: duplicate groups · b / B: keep the best"]
     dupes --> pass["2 · Quick pass over the unrated<br/>x: reject · 1–5: stars"]
     pass --> enough{"AI installed and<br/>≥ 10 rejected + ≥ 10 starred?"}
@@ -51,7 +55,8 @@ flowchart TD
 ```
 
 1. **Start** lazyrate on a folder. It scans all sub folders and, in the background (with progress bars),
-   fingerprints every photo for duplicate detection and — with the AI extra — describes its content once.
+   fingerprints every photo for duplicate detection, reads where it was taken (GPS) and — with the AI extra —
+   describes its content once. `/` finds photos by place, coordinates or (AI) description at any point.
 2. **Clear out bursts** in duplicates mode: keep the best shot of each group with one key.
 3. **Rate quickly**: one key per photo, the list doesn't jump while you rate, `z` undoes.
 4. **Let the AI help** (optional): after a few dozen ratings it suggests ratings for the rest; you accept them
@@ -65,7 +70,11 @@ flowchart TD
 - Background decoding + prefetch of the next images, JPEG draft-mode decoding (24 MP → ~25 ms), EXIF orientation, HEIC/HEIF
 - Ratings stored immediately in SQLite (`ROOT/.lazyrate.sqlite`), keyed by path relative to the root, so the folder can be moved
   (a `.imgrate.sqlite` from before the rename to lazyrate is renamed automatically, ratings are kept)
-- Sort by path, rating (best first) or date taken
+- Sort by path, rating (best first), date taken or place
+- Search by place: GPS positions are read once and named offline (nearest town, region, country from
+  [GeoNames](https://www.geonames.org/)); `/madeira`, `/funchal`, `/portugal` or `/@32.75,-16.95 50km`
+- Maps: an offline map of the view or the search matches in the right pane (`m`), and a browser map with
+  clustered markers, satellite layer and thumbnail popups (`M`, or `lazyrate map ROOT [query]`)
 - Near-duplicate detection (bursts, re-saved or resized copies): perceptual hash computed once in the background
   and cached in SQLite; review one group at a time and keep the best with a single key
 - Review any rating bucket (unrated, rejected, ≥ N stars, any combination) in single view or as a thumbnail grid
@@ -104,7 +113,12 @@ lazyrate export ~/Pictures/2025 ~/calendar --min-rating 4 [--flat] [--symlink] [
 lazyrate export ~/Pictures/2025 ~/maybe --rating 3            # exactly 3 stars (repeatable; 0 = rejected)
 lazyrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.g. read-only folder)
 lazyrate classify ~/Pictures/2025              # AI: index, learn from your ratings, report accuracy + suggestions
+lazyrate search ~/Pictures/2025 madeira        # all photos taken in Madeira (GPS), grouped by town
+lazyrate search ~/Pictures/2025 --near=32.75,-16.95 --radius 50   # within 50 km, nearest first
+lazyrate map ~/Pictures/2025                   # browser map of all photos with GPS data
+lazyrate map ~/Pictures/2025 madeira           # ... of a search's matches (any search form; --output, --no-open)
 lazyrate search ~/Pictures/2025 "dog in snow"  # AI: best matches for a description
+lazyrate search ~/Pictures/2025 "beach madeira"   # AI: Madeira photos, best beach matches first
 lazyrate ~/Pictures/2025 --no-ai               # TUI without AI even if installed
 ```
 
@@ -124,11 +138,13 @@ lazyrate ~/Pictures/2025 --no-ai               # TUI without AI even if installe
 | `n` | next unrated |
 | `v` / `V` | cycle view: all · unrated · not rejected · ≥★ … ★★★★★ · rejected |
 | `f` | choose any combination of ratings to view |
-| `s` | cycle sort: rating (best first, default) · date taken · path |
+| `s` | cycle sort: rating (best first, default) · date taken · path · place (once photos with GPS exist) |
 | `S` | re-sort / re-filter now (re-rated photos move to their new section) |
 | `g` | toggle thumbnail grid (default) / single image |
 | `enter` | full view of the image (nothing else on screen); `enter` or `esc` returns to the previous view |
 | `p` | grid: switch the right pane between a large preview of the highlighted image and the metadata (remembered) |
+| `m` | switch the right pane to a map of the photos in the view (or the search matches), current photo in red |
+| `M` | open that map in the browser |
 | `d` | toggle duplicates mode (each group is a section) |
 | `b` | duplicates mode: keep this one, reject the rest of the group, jump to next group |
 | `E` | export: pick ratings, destination, flat / symlink (remembered for next time) |
@@ -139,7 +155,7 @@ lazyrate ~/Pictures/2025 --no-ai               # TUI without AI even if installe
 | `y` | AI: accept the suggested rating of this photo |
 | `Y` | AI: accept the suggestions of all unrated photos in the section (one undo step) |
 | `B` | AI, duplicates mode: keep the suggested best of the group, reject the rest |
-| `/` | AI: search by content; `esc` ends the search |
+| `/` | search by place (`madeira`), coordinates (`@32.75,-16.95 50km`) or, with AI, content (`beach sunset`, `beach madeira`); `esc` ends the search |
 | `L` | AI: retrain now (otherwise automatic every 10 ratings) |
 | `?` | help |
 
@@ -154,13 +170,48 @@ Indexing takes about 3–7 ms per photo, runs in the background on start, and is
 ### Sections
 
 The list is split into sections depending on the sort order: folders (path), ratings (rating), months
-(date taken) or duplicate groups. The grid shows a header line per section and starts each section on a new row;
+(date taken), towns (place: `Portugal › Madeira › Funchal`) or duplicate groups. The grid shows a header line per section and starts each section on a new row;
 `J`/`K` (or `]`/`.` and `[`/`,`) jump between sections, also in the single-image view. The sidebar lists the
 sections around the current one with their sizes.
 
 The app starts in the grid, sorted by rating. Within a view the list stays stable while you rate, so rating
 doesn't make the cursor jump; press `S` to re-sort and re-filter (re-rated photos move to their new section).
 Section counts are live: a section with re-rated photos waiting for `S` is marked with ↻.
+
+### Places (GPS)
+
+On start lazyrate reads the GPS position of every photo once in the background (EXIF only, about 1 ms per photo;
+JPEG and HEIC) and names it offline after the nearest town, with its region and country. The town table is built
+from GeoNames (every town with ≥ 1,000 inhabitants, 2.7 MB, bundled); big cities get a larger radius, so a photo in
+central Funchal says Funchal and not the parish next door. Nothing is looked up online.
+
+| Search (`/` or `lazyrate search ROOT …`) | Finds |
+| --- | --- |
+| `madeira`, `funchal`, `portugal`, `são vicente` / `sao vicente` | photos whose town, region or country has that name (case and accents don't matter), one section per town |
+| `@32.75,-16.95 50km`, `32.75 -16.95 +-5km`, `near:32.75,-16.95` | photos within the radius (default 10 km), nearest first, sections by distance (`< 1 km`, `1-5 km`, …) |
+| `beach madeira` (AI) | photos taken in Madeira, ranked by how well they match "beach" |
+| anything else (AI) | text search over image content |
+
+Sort **place** (`s`) shows the whole folder by country › region › town; photos without GPS come last. The info pane
+shows town, region, country and the coordinates of the current photo.
+
+#### Maps
+
+- **`m`: map in the right pane**, offline. Land, coastlines and borders from
+  [Natural Earth](https://www.naturalearthdata.com/) (public domain, bundled, 1.7 MB), a yellow dot per photo in
+  the view (while searching: per match), labels for the towns with the most photos, a scale bar, and the current
+  photo in red. It zooms to the photos: a whole island, a country or the world. Good for "where was this?" and
+  "where did I take photos on this trip?"; there are no streets at city level, use the browser map for that.
+- **`M`: map in the browser** (or `lazyrate map ROOT [query]`). One HTML page next to the database
+  (`.lazyrate-map.html`) with clustered markers on OpenStreetMap, a satellite (Esri) and a terrain (OpenTopoMap)
+  layer; clicking a marker shows a thumbnail, rating, place and path (click the thumbnail to open the photo).
+  Thumbnails and coordinates are embedded in the page and never uploaded, but the map tiles are loaded from those
+  services, so they see which area you look at.
+
+Limits: photos without GPS data can't be found this way (older cameras, and images sent through messengers or
+editors that strip EXIF). Names are the English GeoNames names of towns, regions (state, province, island group)
+and countries; landmarks, beaches or mountains ("Pico do Arieiro") are not in the table, but their coordinates are:
+`@32.735,-16.929 3km`.
 
 ### AI suggestions (optional)
 
@@ -244,6 +295,12 @@ once you have rejected 10 and starred 10 photos; star suggestions after 30 starr
 `/` and describe it ("birthday cake", "boat at sunset"); best matches come first, `esc` ends the search.
 From the shell: `lazyrate search ROOT "birthday cake"`.
 
+**Trip album from a mixed archive**
+
+1. `/madeira` (or `/@32.75,-16.95 60km`): every photo taken there, one section per town; `m` shows them on a map.
+2. Rate within the search as usual, `J`/`K` to jump between towns.
+3. `esc`, view **≥ ★★★★**, `s` to **place**: the Madeira keepers are one block; `E` to export.
+
 ## Development
 
 ```sh
@@ -262,3 +319,10 @@ photos.
 ## License
 
 MIT, see [LICENSE](LICENSE).
+
+The bundled town table `src/lazyrate/data/places.tsv.gz` is derived from [GeoNames](https://www.geonames.org/)
+(`cities1000`, admin1 codes, country info) under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/);
+rebuild it with `scripts/build_places.py`. The offline map outlines `src/lazyrate/data/basemap.npz` are from
+[Natural Earth](https://www.naturalearthdata.com/) (public domain); rebuild with `scripts/build_basemap.py`. The
+browser map loads [Leaflet](https://leafletjs.com/) and map tiles from OpenStreetMap, Esri and OpenTopoMap, each
+credited on the map.

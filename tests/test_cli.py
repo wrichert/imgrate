@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 from lazyrate.cli import main
 from lazyrate.export import build_unique_flat_name
+from lazyrate.geo_map import BROWSER_MAP_FILE_NAME
 from lazyrate.store import RatingStore
 
 if TYPE_CHECKING:
@@ -87,3 +88,50 @@ def test_legacy_imgrate_database_is_renamed_and_keeps_ratings(photo_root: Path) 
     assert exit_code == 0
     assert not (photo_root / ".imgrate.sqlite").exists()
     assert RatingStore(photo_root / RatingStore.DEFAULT_FILE_NAME).load_ratings() == {"2023/a.jpg": 5}
+
+
+def test_search_by_place_works_without_ai(geo_root: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(["search", str(geo_root), "madeira"])
+
+    output_lines = capsys.readouterr().out.splitlines()
+    assert exit_code == 0
+    assert len(output_lines) == 3
+    assert output_lines[0].startswith("Portugal › Madeira › Funchal  ")  # noqa: RUF001
+    assert all("/madeira/" in line for line in output_lines)
+
+
+def test_search_near_coordinates_prints_distances(geo_root: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    exit_code = main(["search", str(geo_root), "--near=48.14,11.58", "--radius", "5"])
+
+    output_lines = capsys.readouterr().out.splitlines()
+    assert exit_code == 0
+    assert len(output_lines) == 1
+    assert output_lines[0].strip().startswith("0.")
+    assert output_lines[0].endswith("munich/marienplatz.jpg")
+
+
+def test_stats_reports_gps_once_locations_were_read(geo_root: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    main(["search", str(geo_root), "lisbon"])
+    capsys.readouterr()
+
+    main(["stats", str(geo_root)])
+
+    assert "GPS: 5 photos in 4 towns (Portugal 4, Germany 1)" in capsys.readouterr().out
+
+
+def test_map_writes_a_page_with_all_photos_with_gps(geo_root: Path, tmp_path: Path) -> None:
+    output_path = tmp_path / "map.html"
+
+    exit_code = main(["map", str(geo_root), "--output", str(output_path), "--no-open"])
+
+    assert exit_code == 0
+    assert output_path.read_text().count('"path": ') == 5
+
+
+def test_map_of_a_search_contains_only_the_matches(geo_root: Path) -> None:
+    exit_code = main(["map", str(geo_root), "lisbon", "--no-open"])
+
+    page = (geo_root / BROWSER_MAP_FILE_NAME).read_text()
+    assert exit_code == 0
+    assert page.count('"path": ') == 1
+    assert "lisbon/belem.jpg" in page
