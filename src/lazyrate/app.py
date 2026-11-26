@@ -19,6 +19,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.message import Message
 from textual.widgets import Footer, Label, ProgressBar, Static
 from textual.worker import get_current_worker
 from textual_image.widget import Image as ImageWidget
@@ -26,7 +27,7 @@ from textual_image.widget import get_cell_size
 
 from lazyrate.export import ExportOptions, ExportSummary, export_files
 from lazyrate.fingerprints import Fingerprint, compute_image_signature
-from lazyrate.geo_map import BROWSER_MAP_FILE_NAME, Basemap, BrowserMapWriter, build_town_labels
+from lazyrate.geo_map import BROWSER_MAP_FILE_NAME, Basemap, BrowserMapWriter, MapViewport, build_town_labels
 from lazyrate.geo_search import (
     SearchResult,
     find_place_match,
@@ -70,6 +71,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from PIL import Image
+    from textual import events
     from textual.binding import BindingType
     from textual.geometry import Size
     from textual.timer import Timer
@@ -205,6 +207,56 @@ class SideMapKey:
     located_count: int
     width_px: int
     height_px: int
+    viewport: MapViewport
+
+
+@dataclass(frozen=True, slots=True)
+class PanePosition:
+    """A point in a pane as 0..1 of its width and height, from the top left."""
+
+    x_ratio: float
+    y_ratio: float
+
+
+class MapPane(Container):
+    """The right pane's image box; while it shows the map, the mouse wheel zooms and a click centers the map."""
+
+    class ZoomRequested(Message):
+        def __init__(self, *, steps: int, anchor_x_ratio: float, anchor_y_ratio: float) -> None:
+            super().__init__()
+            self.steps = steps
+            self.anchor_x_ratio = anchor_x_ratio
+            self.anchor_y_ratio = anchor_y_ratio
+
+    class CenterRequested(Message):
+        def __init__(self, *, x_ratio: float, y_ratio: float) -> None:
+            super().__init__()
+            self.x_ratio = x_ratio
+            self.y_ratio = y_ratio
+
+    def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
+        self._request_zoom(event, steps=1)
+
+    def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
+        self._request_zoom(event, steps=-1)
+
+    def on_click(self, event: events.Click) -> None:
+        position = self._locate(event)
+        self.post_message(self.CenterRequested(x_ratio=position.x_ratio, y_ratio=position.y_ratio))
+
+    def _request_zoom(self, event: events.MouseEvent, *, steps: int) -> None:
+        event.stop()
+        position = self._locate(event)
+        self.post_message(
+            self.ZoomRequested(steps=steps, anchor_x_ratio=position.x_ratio, anchor_y_ratio=position.y_ratio)
+        )
+
+    def _locate(self, event: events.MouseEvent) -> PanePosition:
+        """Mouse position in the pane, at the middle of the cell under the mouse."""
+        region = self.content_region
+        x_ratio = (event.screen_x - region.x + 0.5) / max(region.width, 1)
+        y_ratio = (event.screen_y - region.y + 0.5) / max(region.height, 1)
+        return PanePosition(x_ratio=min(max(x_ratio, 0.0), 1.0), y_ratio=min(max(y_ratio, 0.0), 1.0))
 
 
 class TaskProgressRow(Horizontal):
@@ -287,6 +339,7 @@ class ImageRaterApp(App[None]):
     RETRAIN_AFTER_RATING_COUNT = 10
     """Retrain the suggestion model in the background after this many rating changes."""
     PROGRESS_REPORT_STEPS = 100
+    MAP_CONTROLS_HINT = "Map: + / - or mouse wheel zoom · shift+arrows pan · click centers · * fits all photos"
     """Threads report progress at most this many times per task (each report crosses to the UI thread)."""
 
     CSS = """
@@ -372,6 +425,13 @@ class ImageRaterApp(App[None]):
         Binding("p", "toggle_side_pane('preview')", "Big preview"),
         Binding("m", "toggle_side_pane('map')", "Map"),
         Binding("M", "open_browser_map", "Browser map", show=False),
+        Binding("plus,equals_sign", "zoom_map(1)", "Zoom in", show=False),
+        Binding("minus", "zoom_map(-1)", "Zoom out", show=False),
+        Binding("asterisk", "fit_map", "Fit map", show=False),
+        Binding("shift+left", "pan_map(-1, 0)", "Pan west", show=False),
+        Binding("shift+right", "pan_map(1, 0)", "Pan east", show=False),
+        Binding("shift+up", "pan_map(0, -1)", "Pan north", show=False),
+        Binding("shift+down", "pan_map(0, 1)", "Pan south", show=False),
         Binding("a", "toggle_auto_advance", "Auto-adv", show=False),
         Binding("r", "rescan", "Rescan", show=False),
         Binding("question_mark", "help", "Help"),
@@ -407,11 +467,14 @@ class ImageRaterApp(App[None]):
         self._basemap = Basemap()
         self._side_map_key: SideMapKey | None = None
         self._side_map_base: RenderedMap | None = None
+        self._map_viewport = MapViewport()
+        self._map_subject: tuple[str | None, str] | None = None
+        """Search and rating view the map shows; zoom and pan reset when it changes."""
         self._grid_layout_key: GridLayoutKey | None = None
         self._grid_rows: list[GridRow] = []
         self._grid_pages: list[GridPage] = []
         self._shown_grid_page: GridPage | None = None
-        self._resize_timer: Timer | None = None
+        self._view_refresh_timer: Timer | None = None
         self._current_preview: Preview | None = None
 
     def compose(self) -> ComposeResult:
@@ -421,7 +484,7 @@ class ImageRaterApp(App[None]):
                 yield Static("", id="placeholder")
             yield Container(id="grid")
             with Vertical(id="sidebar"):
-                with Container(id="side-preview"):
+                with MapPane(id="side-preview"):
                     yield ImageWidget(id="side-preview-image")
                 yield Static(id="info")
                 yield Static(id="sections")
@@ -447,9 +510,9 @@ class ImageRaterApp(App[None]):
         self._preview_cache.shutdown()
 
     def on_resize(self) -> None:
-        if self._resize_timer is not None:
-            self._resize_timer.stop()
-        self._resize_timer = self.set_timer(self.RESIZE_DEBOUNCE_SECONDS, self._refresh_all)
+        if self._view_refresh_timer is not None:
+            self._view_refresh_timer.stop()
+        self._view_refresh_timer = self.set_timer(self.RESIZE_DEBOUNCE_SECONDS, self._refresh_all)
 
     # ----------------------------------------------------------------- actions
 
@@ -571,10 +634,29 @@ class ImageRaterApp(App[None]):
         self._session.save_setting(key=self.SIDE_PANE_SETTING_KEY, value=self._side_pane_mode.value)
         if self._side_pane_mode is SidePaneMode.PREVIEW and not self._is_grid_mode:
             self.notify("The large preview in the right pane is shown in grid view (g)", timeout=3)
-        if self._side_pane_mode is SidePaneMode.MAP and self._session.located_count == 0:
-            self.notify("No photo here has GPS data (yet) — the map stays empty", timeout=4)
+        if self._side_pane_mode is SidePaneMode.MAP:
+            self.notify(self.MAP_CONTROLS_HINT, timeout=4)
         self._apply_view_mode()
         self.call_after_refresh(self._refresh_all)
+
+    def action_zoom_map(self, steps: int) -> None:
+        self._change_map_viewport(self._map_viewport.zoom(steps=steps))
+
+    def action_pan_map(self, x_steps: int, y_steps: int) -> None:
+        self._change_map_viewport(self._map_viewport.pan(x_steps=x_steps, y_steps=y_steps))
+
+    def action_fit_map(self) -> None:
+        self._change_map_viewport(MapViewport())
+
+    def on_map_pane_zoom_requested(self, message: MapPane.ZoomRequested) -> None:
+        self._change_map_viewport(
+            self._map_viewport.zoom(
+                steps=message.steps, anchor_x_ratio=message.anchor_x_ratio, anchor_y_ratio=message.anchor_y_ratio
+            )
+        )
+
+    def on_map_pane_center_requested(self, message: MapPane.CenterRequested) -> None:
+        self._change_map_viewport(self._map_viewport.center_on(x_ratio=message.x_ratio, y_ratio=message.y_ratio))
 
     def action_open_browser_map(self) -> None:
         """Write the photos of the view (or the search matches) to an HTML map and open it in the browser."""
@@ -1445,6 +1527,10 @@ class ImageRaterApp(App[None]):
         box_size = self.query_one("#side-preview").content_size
         if box_size.width == 0 or box_size.height == 0:
             return
+        map_subject = (self._session.search_query, self._session.rating_filter.name)
+        if map_subject != self._map_subject:
+            self._map_subject = map_subject
+            self._map_viewport = MapViewport()
         cell_size = get_cell_size()
         map_key = SideMapKey(
             view_version=self._session.view_version,
@@ -1452,6 +1538,7 @@ class ImageRaterApp(App[None]):
             located_count=self._session.located_count,
             width_px=box_size.width * cell_size.width,
             height_px=box_size.height * cell_size.height,
+            viewport=self._map_viewport,
         )
         current_file = self._session.current_file
         current_location = None if current_file is None else self._session.get_location(current_file)
@@ -1485,6 +1572,8 @@ class ImageRaterApp(App[None]):
                 labels=build_town_labels(map_points),
                 width_px=map_key.width_px,
                 height_px=map_key.height_px,
+                viewport=map_key.viewport,
+                notice=None if map_points else self._describe_empty_map(map_key),
             )
             self._side_map_key = map_key
             self._side_map_base = base_map
@@ -1492,6 +1581,19 @@ class ImageRaterApp(App[None]):
             return
         map_image = self._basemap.draw_highlight(base_map, highlighted=highlighted)
         self.call_from_thread(self._display_side_map, map_image, box_size)
+
+    def _change_map_viewport(self, viewport: MapViewport) -> None:
+        if not self._is_side_map_shown or viewport == self._map_viewport:
+            return
+        self._map_viewport = viewport
+        self._show_side_map()
+
+    def _describe_empty_map(self, map_key: SideMapKey) -> str:
+        if map_key.located_count == 0:
+            return "No photo here has GPS data"
+        if map_key.search_query is not None:
+            return "No search match has GPS data"
+        return "No photo in this view has GPS data"
 
     def _open_with_default_app(self, path: Path) -> None:
         opener_command = "open" if sys.platform == "darwin" else "xdg-open"

@@ -10,6 +10,7 @@ from lazyrate.geo_map import (
     Basemap,
     BrowserMapWriter,
     MapPoint,
+    MapViewport,
     build_town_labels,
     choose_scale_bar_km,
     fit_extent,
@@ -64,6 +65,69 @@ def test_highlight_is_drawn_on_a_copy_of_the_cached_base_map() -> None:
     highlighted_colors = {color for _count, color in highlighted_image.getcolors(maxcolors=100_000)}
     assert Basemap.COLORS.current not in base_colors
     assert Basemap.COLORS.current in highlighted_colors
+
+
+def test_world_view_without_photos_keeps_the_aspect_ratio_of_the_pane() -> None:
+    wide_extent = fit_extent([], aspect_ratio=2.5)
+    narrow_extent = fit_extent([], aspect_ratio=1.4)
+
+    assert wide_extent.longitude_span_deg / wide_extent.latitude_span_deg == pytest.approx(2.5)
+    assert narrow_extent.longitude_span_deg / narrow_extent.latitude_span_deg == pytest.approx(1.4)
+    assert narrow_extent.latitude_span_deg <= 170
+
+
+def test_zooming_in_keeps_the_point_under_the_mouse_in_place() -> None:
+    fitted_extent = fit_extent([FUNCHAL, MUNICH], aspect_ratio=1.5)
+    viewport = MapViewport()
+    anchor_x_ratio, anchor_y_ratio = 0.8, 0.3
+    anchor_longitude_deg = fitted_extent.min_longitude_deg + anchor_x_ratio * fitted_extent.longitude_span_deg
+    anchor_latitude_deg = fitted_extent.max_latitude_deg - anchor_y_ratio * fitted_extent.latitude_span_deg
+
+    zoomed_extent = viewport.zoom(steps=2, anchor_x_ratio=anchor_x_ratio, anchor_y_ratio=anchor_y_ratio).apply(
+        fitted_extent
+    )
+
+    assert zoomed_extent.longitude_span_deg == pytest.approx(fitted_extent.longitude_span_deg / 4)
+    assert zoomed_extent.min_longitude_deg + anchor_x_ratio * zoomed_extent.longitude_span_deg == pytest.approx(
+        anchor_longitude_deg
+    )
+    assert zoomed_extent.max_latitude_deg - anchor_y_ratio * zoomed_extent.latitude_span_deg == pytest.approx(
+        anchor_latitude_deg
+    )
+
+
+def test_panning_and_centering_move_the_visible_area() -> None:
+    fitted_extent = fit_extent([FUNCHAL, MUNICH], aspect_ratio=1.5)
+    zoomed_viewport = MapViewport().zoom(steps=1)
+
+    east_extent = zoomed_viewport.pan(x_steps=1, y_steps=0).apply(fitted_extent)
+    north_extent = zoomed_viewport.pan(x_steps=0, y_steps=-1).apply(fitted_extent)
+    centered_extent = MapViewport().center_on(x_ratio=1.0, y_ratio=0.5).apply(fitted_extent)
+
+    visible_width_deg = fitted_extent.longitude_span_deg / 2
+    assert east_extent.min_longitude_deg - zoomed_viewport.apply(fitted_extent).min_longitude_deg == pytest.approx(
+        visible_width_deg * MapViewport.PAN_STEP_RATIO
+    )
+    assert north_extent.max_latitude_deg > zoomed_viewport.apply(fitted_extent).max_latitude_deg
+    assert (centered_extent.min_longitude_deg + centered_extent.max_longitude_deg) / 2 == pytest.approx(
+        fitted_extent.max_longitude_deg
+    )
+    assert MapViewport().zoom(steps=1).zoom(steps=-1).is_fitted
+
+
+def test_zoom_level_is_limited() -> None:
+    viewport = MapViewport().zoom(steps=100)
+
+    assert viewport.zoom_level == MapViewport.MAX_ZOOM_LEVEL
+
+
+def test_a_notice_is_written_across_an_empty_map() -> None:
+    basemap = Basemap()
+
+    plain_map = basemap.render_base(points=[], labels=[], width_px=400, height_px=300)
+    noticed_map = basemap.render_base(points=[], labels=[], width_px=400, height_px=300, notice="No GPS data")
+
+    assert plain_map.image.tobytes() != noticed_map.image.tobytes()
 
 
 def test_town_labels_put_the_busiest_towns_first() -> None:

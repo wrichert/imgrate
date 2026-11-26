@@ -269,6 +269,8 @@ HELP_TEXT = """\
   g              toggle thumbnail grid (default) / single image
   p              grid: right pane shows the highlighted image large / metadata
   m              right pane shows a map of the photos in the view (or the search matches) / metadata
+  + / -  *       map: zoom in / out (or mouse wheel) · fit all photos again; click centers the map
+  shift+arrows   map: pan
   M              open that map in the browser (OpenStreetMap / satellite; thumbnails in the popups)
   enter          full view of the image; enter / esc returns to grid or single view
 

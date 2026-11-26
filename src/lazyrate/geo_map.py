@@ -16,9 +16,9 @@ import math
 import threading
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import resources
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
@@ -35,6 +35,8 @@ if TYPE_CHECKING:
 register_heif_opener()
 
 MAX_LATITUDE_DEG = 85.0
+WORLD_CENTER_LONGITUDE_DEG = 10.0
+"""The world view (no photo with GPS) is centered on Europe / Africa when the pane is too narrow for all of it."""
 LABEL_FONT_CANDIDATES = (
     "Arial.ttf",
     "DejaVuSans.ttf",
@@ -125,7 +127,7 @@ def fit_extent(
 ) -> MapExtent:
     """Smallest rectangle around ``points`` (plus padding, at least ``min_span_km``) with ``aspect_ratio`` = w / h."""
     if not points:
-        return MapExtent(-180.0, 180.0, -60.0, MAX_LATITUDE_DEG)
+        return fit_world_extent(aspect_ratio=aspect_ratio)
     longitudes_deg = [point.longitude_deg for point in points]
     latitudes_deg = [point.latitude_deg for point in points]
     center_latitude_deg = (min(latitudes_deg) + max(latitudes_deg)) / 2
@@ -149,6 +151,89 @@ def fit_extent(
         min_latitude_deg=center_latitude_deg - half_latitude_span_deg,
         max_latitude_deg=center_latitude_deg + half_latitude_span_deg,
     )
+
+
+def fit_world_extent(*, aspect_ratio: float) -> MapExtent:
+    """The whole world if the pane is wide enough, else its middle; undistorted either way."""
+    height_deg = min(360.0 / aspect_ratio, 2 * MAX_LATITUDE_DEG)
+    half_width_deg = height_deg * aspect_ratio / 2
+    return MapExtent(
+        min_longitude_deg=WORLD_CENTER_LONGITUDE_DEG - half_width_deg,
+        max_longitude_deg=WORLD_CENTER_LONGITUDE_DEG + half_width_deg,
+        min_latitude_deg=-height_deg / 2,
+        max_latitude_deg=height_deg / 2,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class MapViewport:
+    """Zoom and pan on top of the extent fitted to the photos.
+
+    The center is measured in widths / heights of the fitted extent from its middle; ``x`` grows east, ``y`` south
+    (like pixels).
+    """
+
+    ZOOM_STEP_FACTOR: ClassVar[float] = 2.0
+    MIN_ZOOM_LEVEL: ClassVar[int] = -4
+    MAX_ZOOM_LEVEL: ClassVar[int] = 14
+    PAN_STEP_RATIO: ClassVar[float] = 0.25
+    """One pan step moves the map by this share of the visible width or height."""
+
+    zoom_level: int = 0
+    center_x_ratio: float = 0.0
+    center_y_ratio: float = 0.0
+
+    @property
+    def zoom_factor(self) -> float:
+        return self.ZOOM_STEP_FACTOR**self.zoom_level
+
+    @property
+    def is_fitted(self) -> bool:
+        return self == MapViewport()
+
+    def zoom(self, *, steps: int, anchor_x_ratio: float = 0.5, anchor_y_ratio: float = 0.5) -> MapViewport:
+        """Zoom in (``steps`` > 0) or out, keeping the map position under the anchor (0..1 of the pane) in place."""
+        zoom_level = max(self.MIN_ZOOM_LEVEL, min(self.MAX_ZOOM_LEVEL, self.zoom_level + steps))
+        new_zoom_factor = self.ZOOM_STEP_FACTOR**zoom_level
+        anchor_x_offset = anchor_x_ratio - 0.5
+        anchor_y_offset = anchor_y_ratio - 0.5
+        return MapViewport(
+            zoom_level=zoom_level,
+            center_x_ratio=self.center_x_ratio + anchor_x_offset / self.zoom_factor - anchor_x_offset / new_zoom_factor,
+            center_y_ratio=self.center_y_ratio + anchor_y_offset / self.zoom_factor - anchor_y_offset / new_zoom_factor,
+        )
+
+    def pan(self, *, x_steps: int, y_steps: int) -> MapViewport:
+        step_ratio = self.PAN_STEP_RATIO / self.zoom_factor
+        return replace(
+            self,
+            center_x_ratio=self.center_x_ratio + x_steps * step_ratio,
+            center_y_ratio=self.center_y_ratio + y_steps * step_ratio,
+        )
+
+    def center_on(self, *, x_ratio: float, y_ratio: float) -> MapViewport:
+        """Move the map position at ``x_ratio`` / ``y_ratio`` (0..1 of the pane) to the middle."""
+        return replace(
+            self,
+            center_x_ratio=self.center_x_ratio + (x_ratio - 0.5) / self.zoom_factor,
+            center_y_ratio=self.center_y_ratio + (y_ratio - 0.5) / self.zoom_factor,
+        )
+
+    def apply(self, fitted_extent: MapExtent) -> MapExtent:
+        center_longitude_deg = (
+            fitted_extent.min_longitude_deg + (0.5 + self.center_x_ratio) * fitted_extent.longitude_span_deg
+        )
+        center_latitude_deg = (
+            fitted_extent.max_latitude_deg - (0.5 + self.center_y_ratio) * fitted_extent.latitude_span_deg
+        )
+        half_longitude_span_deg = fitted_extent.longitude_span_deg / self.zoom_factor / 2
+        half_latitude_span_deg = fitted_extent.latitude_span_deg / self.zoom_factor / 2
+        return MapExtent(
+            min_longitude_deg=center_longitude_deg - half_longitude_span_deg,
+            max_longitude_deg=center_longitude_deg + half_longitude_span_deg,
+            min_latitude_deg=center_latitude_deg - half_latitude_span_deg,
+            max_latitude_deg=center_latitude_deg + half_latitude_span_deg,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,11 +326,21 @@ class Basemap:
         return self.draw_highlight(base_map, highlighted=highlighted)
 
     def render_base(
-        self, *, points: Sequence[GeoCoordinates], labels: Sequence[MapLabel], width_px: int, height_px: int
+        self,
+        *,
+        points: Sequence[GeoCoordinates],
+        labels: Sequence[MapLabel],
+        width_px: int,
+        height_px: int,
+        viewport: MapViewport | None = None,
+        notice: str | None = None,
     ) -> RenderedMap:
-        """Everything except the highlighted photo, framed around ``points``; cache it while only the cursor moves."""
+        """Everything except the highlighted photo, framed around ``points`` (then zoomed / panned by ``viewport``);
+        cache it while only the cursor moves. ``notice`` is written across the middle (e.g. "no GPS data")."""
         land, borders = self._load()
         extent = fit_extent(points, aspect_ratio=width_px / height_px)
+        if viewport is not None:
+            extent = viewport.apply(extent)
         image = Image.new("RGB", (width_px, height_px), self.COLORS.water)
         draw = ImageDraw.Draw(image)
         self._draw_land(draw, land=land, extent=extent, width_px=width_px, height_px=height_px)
@@ -253,6 +348,8 @@ class Basemap:
         self._draw_points(draw, points=points, highlighted=None, extent=extent, image_size=image.size)
         self._draw_labels(draw, labels=labels, extent=extent, image_size=image.size)
         draw_scale_bar(draw, extent=extent, image_size=image.size, color=self.COLORS.text)
+        if notice is not None:
+            self._draw_notice(draw, notice=notice, image_size=image.size)
         return RenderedMap(image=image, extent=extent)
 
     def draw_highlight(self, base_map: RenderedMap, *, highlighted: GeoCoordinates | None) -> Image.Image:
@@ -335,6 +432,21 @@ class Basemap:
                 outline=self.COLORS.current_outline,
                 width=2,
             )
+
+    def _draw_notice(self, draw: ImageDraw.ImageDraw, *, notice: str, image_size: tuple[int, int]) -> None:
+        width_px, height_px = image_size
+        font_size_px = max(12, min(width_px, height_px) // 24)
+        label_font = load_label_font(font_size_px)
+        center_px = (width_px / 2, height_px / 2)
+        text = label_font.prepare_text(notice)
+        text_box = draw.textbbox(center_px, text, font=label_font.font, anchor="mm")
+        padding_px = font_size_px // 2
+        draw.rectangle(
+            (text_box[0] - padding_px, text_box[1] - padding_px, text_box[2] + padding_px, text_box[3] + padding_px),
+            fill=self.COLORS.water,
+            outline=self.COLORS.coast,
+        )
+        draw.text(center_px, text, fill=self.COLORS.text, font=label_font.font, anchor="mm")
 
     def _draw_labels(
         self, draw: ImageDraw.ImageDraw, *, labels: Sequence[MapLabel], extent: MapExtent, image_size: tuple[int, int]

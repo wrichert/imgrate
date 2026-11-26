@@ -573,3 +573,51 @@ async def test_m_shows_the_map_of_search_matches_and_capital_m_writes_the_browse
     assert page.count('"path": ') == 3
     assert "munich" not in page
     assert store.database_path.exists()
+
+
+async def test_map_zooms_pans_and_fits_again_and_resets_for_a_new_search(geo_root: Path) -> None:
+    store = RatingStore(geo_root / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(geo_root), store=store)
+    app = ImageRaterApp(session=session, database_path=store.database_path)
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_locations(pilot, session)
+        await search_for(pilot, "madeira")
+        await pilot.press("m")
+        await pilot.pause()
+        await pilot.press("plus", "plus", "shift+right")
+        zoomed_viewport = app._map_viewport
+        await pilot.click("#side-preview", offset=(2, 2))
+        clicked_viewport = app._map_viewport
+        await pilot.press("asterisk")
+        fitted_viewport = app._map_viewport
+        await pilot.press("plus")
+        await search_for(pilot, "portugal")
+        await pilot.pause()
+        viewport_after_search = app._map_viewport
+    store.close()
+
+    assert zoomed_viewport.zoom_level == 2
+    assert zoomed_viewport.center_x_ratio > 0
+    assert clicked_viewport.center_x_ratio < zoomed_viewport.center_x_ratio
+    assert fitted_viewport.is_fitted
+    assert viewport_after_search.is_fitted
+
+
+async def test_every_terminal_resize_relayouts_the_grid(session: RatingSession) -> None:
+    """Regression: the app's own debounce timer shadowed Textual's ``App._resize_timer``, so after the first resize
+    the screen was never laid out again."""
+    app = ImageRaterApp(session=session, database_path=session.root / RatingStore.DEFAULT_FILE_NAME)
+    layout_keys = []
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        for width, height in [(160, 50), (100, 30), (140, 45)]:
+            await pilot.resize_terminal(width, height)
+            await pilot.pause(ImageRaterApp.RESIZE_DEBOUNCE_SECONDS + 0.1)
+            layout_keys.append(app._grid_layout_key)
+
+    statusbar_and_footer_height = 2
+    assert [key.available_height for key in layout_keys] == [
+        height - statusbar_and_footer_height for height in (50, 30, 45)
+    ]
