@@ -211,6 +211,14 @@ class MapViewport:
             center_y_ratio=self.center_y_ratio + y_steps * step_ratio,
         )
 
+    def drag(self, *, x_ratio_delta: float, y_ratio_delta: float) -> MapViewport:
+        """The map follows the mouse: dragging up shows what lies further south."""
+        return replace(
+            self,
+            center_x_ratio=self.center_x_ratio - x_ratio_delta / self.zoom_factor,
+            center_y_ratio=self.center_y_ratio - y_ratio_delta / self.zoom_factor,
+        )
+
     def center_on(self, *, x_ratio: float, y_ratio: float) -> MapViewport:
         """Move the map position at ``x_ratio`` / ``y_ratio`` (0..1 of the pane) to the middle."""
         return replace(
@@ -234,6 +242,31 @@ class MapViewport:
             min_latitude_deg=center_latitude_deg - half_latitude_span_deg,
             max_latitude_deg=center_latitude_deg + half_latitude_span_deg,
         )
+
+
+def find_points_near(
+    points: Sequence[MapPoint],
+    *,
+    extent: MapExtent,
+    image_size: tuple[int, int],
+    x_ratio: float,
+    y_ratio: float,
+    max_distance_px: float,
+) -> list[str]:
+    """Paths of the photos drawn within ``max_distance_px`` of a position (0..1 of the map), nearest first."""
+    if not points:
+        return []
+    width_px, height_px = image_size
+    pixel_positions = extent.project(
+        longitudes_deg=np.array([point.coordinates.longitude_deg for point in points]),
+        latitudes_deg=np.array([point.coordinates.latitude_deg for point in points]),
+        width_px=width_px,
+        height_px=height_px,
+    )
+    distances_px = np.hypot(pixel_positions[:, 0] - x_ratio * width_px, pixel_positions[:, 1] - y_ratio * height_px)
+    near_indices = np.flatnonzero(distances_px <= max_distance_px)
+    near_indices = near_indices[np.argsort(distances_px[near_indices], kind="stable")]
+    return [points[index].relative_path for index in near_indices.tolist()]
 
 
 @dataclass(frozen=True, slots=True)

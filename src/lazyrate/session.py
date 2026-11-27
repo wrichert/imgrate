@@ -434,6 +434,14 @@ class RatingSession:
             return
         self._current_index = max(0, min(index, len(self._visible_files) - 1))
 
+    def move_to_file(self, relative_path: str) -> bool:
+        """Put the cursor on a visible file; returns whether it is in the view."""
+        for index, media_file in enumerate(self._visible_files):
+            if media_file.relative_path == relative_path:
+                self._current_index = index
+                return True
+        return False
+
     def move_by(self, delta: int) -> None:
         self.move_to(self._current_index + delta)
 

@@ -144,7 +144,7 @@ lazyrate ~/Pictures/2025 --no-ai               # TUI without AI even if installe
 | `enter` | full view of the image (nothing else on screen); `enter` or `esc` returns to the previous view |
 | `p` | grid: switch the right pane between a large preview of the highlighted image and the metadata (remembered) |
 | `m` | switch the right pane to a map of the photos in the view (or the search matches), current photo in red |
-| `+` `-` `*` | map: zoom in / out (also the mouse wheel), fit all photos again; shift+arrows pan, a click centers |
+| `+` `-` `*` | map: zoom in / out (also the mouse wheel), fit all photos again; shift+arrows or dragging pan; clicking a dot selects its photo |
 | `M` | open that map in the browser |
 | `d` | toggle duplicates mode (each group is a section) |
 | `b` | duplicates mode: keep this one, reject the rest of the group, jump to next group |
@@ -202,7 +202,8 @@ shows town, region, country and the coordinates of the current photo.
   [Natural Earth](https://www.naturalearthdata.com/) (public domain, bundled, 1.7 MB), a yellow dot per photo in
   the view (while searching: per match), labels for the towns with the most photos, a scale bar, and the current
   photo in red. It frames the photos: a whole island, a country or the world; `+` / `-` or the mouse wheel zoom,
-  shift+arrows pan, a click centers, `*` frames all photos again. Good for "where was this?" and
+  dragging or shift+arrows pan, `*` frames all photos again. Clicking a dot selects its photo in the grid (click
+  again to step through photos taken at the same spot); clicking elsewhere centers the map there. Good for "where was this?" and
   "where did I take photos on this trip?"; there are no streets at city level, use the browser map for that.
 - **`M`: map in the browser** (or `lazyrate map ROOT [query]`). One HTML page next to the database
   (`.lazyrate-map.html`) with clustered markers on OpenStreetMap, a satellite (Esri) and a terrain (OpenTopoMap)

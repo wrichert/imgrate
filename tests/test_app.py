@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+import numpy as np
 from PIL import Image
 from textual.content import Content
 from textual.widgets import Input, Static
@@ -587,7 +588,7 @@ async def test_map_zooms_pans_and_fits_again_and_resets_for_a_new_search(geo_roo
         await pilot.pause()
         await pilot.press("plus", "plus", "shift+right")
         zoomed_viewport = app._map_viewport
-        await pilot.click("#side-preview", offset=(2, 2))
+        await pilot.click("#side-preview", offset=(2, 2))  # water, no dot: centers the map there
         clicked_viewport = app._map_viewport
         await pilot.press("asterisk")
         fitted_viewport = app._map_viewport
@@ -621,3 +622,38 @@ async def test_every_terminal_resize_relayouts_the_grid(session: RatingSession) 
     assert [key.available_height for key in layout_keys] == [
         height - statusbar_and_footer_height for height in (50, 30, 45)
     ]
+
+
+async def test_clicking_a_dot_on_the_map_selects_its_photo_and_dragging_pans(geo_root: Path) -> None:
+    store = RatingStore(geo_root / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(geo_root), store=store)
+    app = ImageRaterApp(session=session, database_path=store.database_path)
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_locations(pilot, session)
+        await search_for(pilot, "@48.1374,11.5755 500km")  # Munich only
+        await pilot.press("m")
+        for _ in range(60):
+            await pilot.pause(0.05)
+            if app._side_map_base is not None and app._side_map_points:
+                break
+        pane_size = app.query_one("#side-preview").content_size
+        munich_point = next(point for point in app._side_map_points if "munich" in point.relative_path)
+        ((x_px, y_px),) = app._side_map_base.extent.project(
+            longitudes_deg=np.array([munich_point.coordinates.longitude_deg]),
+            latitudes_deg=np.array([munich_point.coordinates.latitude_deg]),
+            width_px=pane_size.width,
+            height_px=pane_size.height,
+        ).tolist()
+        session.move_to(session.visible_count - 1)  # an "other photo", not Munich
+        await pilot.click("#side-preview", offset=(int(x_px), int(y_px)))
+        selected_path = session.current_file.relative_path
+        await pilot.mouse_down("#side-preview", offset=(10, 10))
+        await pilot.hover("#side-preview", offset=(10, 5))
+        await pilot.mouse_up("#side-preview", offset=(10, 5))
+        dragged_viewport = app._map_viewport
+    store.close()
+
+    assert selected_path == munich_point.relative_path
+    assert dragged_viewport.center_y_ratio > 0  # pulled up: the map moves south
+    assert dragged_viewport.zoom_level == 0

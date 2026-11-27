@@ -27,7 +27,14 @@ from textual_image.widget import get_cell_size
 
 from lazyrate.export import ExportOptions, ExportSummary, export_files
 from lazyrate.fingerprints import Fingerprint, compute_image_signature
-from lazyrate.geo_map import BROWSER_MAP_FILE_NAME, Basemap, BrowserMapWriter, MapViewport, build_town_labels
+from lazyrate.geo_map import (
+    BROWSER_MAP_FILE_NAME,
+    Basemap,
+    BrowserMapWriter,
+    MapViewport,
+    build_town_labels,
+    find_points_near,
+)
 from lazyrate.geo_search import (
     SearchResult,
     find_place_match,
@@ -219,20 +226,33 @@ class PanePosition:
 
 
 class MapPane(Container):
-    """The right pane's image box; while it shows the map, the mouse wheel zooms and a click centers the map."""
+    """The right pane's image box. While it shows the map: the mouse wheel zooms, dragging pans, a click selects the
+    photo under the mouse (or centers the map there)."""
 
     class ZoomRequested(Message):
-        def __init__(self, *, steps: int, anchor_x_ratio: float, anchor_y_ratio: float) -> None:
+        def __init__(self, *, steps: int, anchor: PanePosition) -> None:
             super().__init__()
             self.steps = steps
-            self.anchor_x_ratio = anchor_x_ratio
-            self.anchor_y_ratio = anchor_y_ratio
+            self.anchor = anchor
 
-    class CenterRequested(Message):
-        def __init__(self, *, x_ratio: float, y_ratio: float) -> None:
+    class DragRequested(Message):
+        """The mouse moved by ``x_ratio_delta`` / ``y_ratio_delta`` (shares of the pane) with the button held."""
+
+        def __init__(self, *, x_ratio_delta: float, y_ratio_delta: float) -> None:
             super().__init__()
-            self.x_ratio = x_ratio
-            self.y_ratio = y_ratio
+            self.x_ratio_delta = x_ratio_delta
+            self.y_ratio_delta = y_ratio_delta
+
+    class Clicked(Message):
+        def __init__(self, *, position: PanePosition) -> None:
+            super().__init__()
+            self.position = position
+
+    def __init__(self, *, id: str | None = None) -> None:
+        super().__init__(id=id)
+        self._drag_start: PanePosition | None = None
+        self._drag_last: PanePosition | None = None
+        self._is_dragging = False
 
     def on_mouse_scroll_up(self, event: events.MouseScrollUp) -> None:
         self._request_zoom(event, steps=1)
@@ -240,23 +260,48 @@ class MapPane(Container):
     def on_mouse_scroll_down(self, event: events.MouseScrollDown) -> None:
         self._request_zoom(event, steps=-1)
 
-    def on_click(self, event: events.Click) -> None:
+    def on_mouse_down(self, event: events.MouseDown) -> None:
+        event.stop()
+        self._drag_start = self._drag_last = self._locate(event)
+        self._is_dragging = False
+        self.capture_mouse()
+
+    def on_mouse_move(self, event: events.MouseMove) -> None:
+        if self._drag_start is None or self._drag_last is None:
+            return
         position = self._locate(event)
-        self.post_message(self.CenterRequested(x_ratio=position.x_ratio, y_ratio=position.y_ratio))
+        if not self._is_dragging and position == self._drag_start:
+            return
+        self._is_dragging = True
+        self.post_message(
+            self.DragRequested(
+                x_ratio_delta=position.x_ratio - self._drag_last.x_ratio,
+                y_ratio_delta=position.y_ratio - self._drag_last.y_ratio,
+            )
+        )
+        self._drag_last = position
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        if self._drag_start is None:
+            return
+        event.stop()
+        self.release_mouse()
+        if not self._is_dragging:
+            self.post_message(self.Clicked(position=self._drag_start))
+        self._drag_start = self._drag_last = None
+        self._is_dragging = False
 
     def _request_zoom(self, event: events.MouseEvent, *, steps: int) -> None:
         event.stop()
-        position = self._locate(event)
-        self.post_message(
-            self.ZoomRequested(steps=steps, anchor_x_ratio=position.x_ratio, anchor_y_ratio=position.y_ratio)
-        )
+        self.post_message(self.ZoomRequested(steps=steps, anchor=self._locate(event)))
 
     def _locate(self, event: events.MouseEvent) -> PanePosition:
-        """Mouse position in the pane, at the middle of the cell under the mouse."""
+        """Mouse position in the pane, at the middle of the cell under the mouse (outside 0..1 while dragging out)."""
         region = self.content_region
-        x_ratio = (event.screen_x - region.x + 0.5) / max(region.width, 1)
-        y_ratio = (event.screen_y - region.y + 0.5) / max(region.height, 1)
-        return PanePosition(x_ratio=min(max(x_ratio, 0.0), 1.0), y_ratio=min(max(y_ratio, 0.0), 1.0))
+        return PanePosition(
+            x_ratio=(event.screen_x - region.x + 0.5) / max(region.width, 1),
+            y_ratio=(event.screen_y - region.y + 0.5) / max(region.height, 1),
+        )
 
 
 class TaskProgressRow(Horizontal):
@@ -339,7 +384,9 @@ class ImageRaterApp(App[None]):
     RETRAIN_AFTER_RATING_COUNT = 10
     """Retrain the suggestion model in the background after this many rating changes."""
     PROGRESS_REPORT_STEPS = 100
-    MAP_CONTROLS_HINT = "Map: + / - or mouse wheel zoom · shift+arrows pan · click centers · * fits all photos"
+    MAP_CONTROLS_HINT = "Map: wheel or + / - zoom · drag or shift+arrows pan · click a dot selects · * fits all"
+    MAP_CLICK_RADIUS_CELLS = 1.0
+    """A click this close to a dot (in cell widths) selects its photo."""
     """Threads report progress at most this many times per task (each report crosses to the UI thread)."""
 
     CSS = """
@@ -467,6 +514,8 @@ class ImageRaterApp(App[None]):
         self._basemap = Basemap()
         self._side_map_key: SideMapKey | None = None
         self._side_map_base: RenderedMap | None = None
+        self._side_map_points: list[MapPoint] = []
+        """The dots of the shown map, for clicking on them."""
         self._map_viewport = MapViewport()
         self._map_subject: tuple[str | None, str] | None = None
         """Search and rating view the map shows; zoom and pan reset when it changes."""
@@ -651,12 +700,44 @@ class ImageRaterApp(App[None]):
     def on_map_pane_zoom_requested(self, message: MapPane.ZoomRequested) -> None:
         self._change_map_viewport(
             self._map_viewport.zoom(
-                steps=message.steps, anchor_x_ratio=message.anchor_x_ratio, anchor_y_ratio=message.anchor_y_ratio
+                steps=message.steps, anchor_x_ratio=message.anchor.x_ratio, anchor_y_ratio=message.anchor.y_ratio
             )
         )
 
-    def on_map_pane_center_requested(self, message: MapPane.CenterRequested) -> None:
-        self._change_map_viewport(self._map_viewport.center_on(x_ratio=message.x_ratio, y_ratio=message.y_ratio))
+    def on_map_pane_drag_requested(self, message: MapPane.DragRequested) -> None:
+        self._change_map_viewport(
+            self._map_viewport.drag(x_ratio_delta=message.x_ratio_delta, y_ratio_delta=message.y_ratio_delta)
+        )
+
+    def on_map_pane_clicked(self, message: MapPane.Clicked) -> None:
+        """A click on a dot selects its photo (repeated clicks cycle through photos taken at the same spot); a click
+        elsewhere centers the map there."""
+        if not self._is_side_map_shown or self._side_map_base is None:
+            return
+        cell_size = get_cell_size()
+        clicked_paths = find_points_near(
+            self._side_map_points,
+            extent=self._side_map_base.extent,
+            image_size=self._side_map_base.image.size,
+            x_ratio=message.position.x_ratio,
+            y_ratio=message.position.y_ratio,
+            max_distance_px=self.MAP_CLICK_RADIUS_CELLS * cell_size.width,
+        )
+        if not clicked_paths:
+            self._change_map_viewport(
+                self._map_viewport.center_on(x_ratio=message.position.x_ratio, y_ratio=message.position.y_ratio)
+            )
+            return
+        current_file = self._session.current_file
+        current_path = None if current_file is None else current_file.relative_path
+        next_offset = clicked_paths.index(current_path) + 1 if current_path in clicked_paths else 0
+        selected_path = clicked_paths[next_offset % len(clicked_paths)]
+        if not self._session.move_to_file(selected_path):
+            return
+        if len(clicked_paths) > 1:
+            position_text = f"{next_offset % len(clicked_paths) + 1}/{len(clicked_paths)}"
+            self.notify(f"{len(clicked_paths)} photos here ({position_text}), click again for the next", timeout=2)
+        self._refresh_all()
 
     def action_open_browser_map(self) -> None:
         """Write the photos of the view (or the search matches) to an HTML map and open it in the browser."""
@@ -1545,6 +1626,8 @@ class ImageRaterApp(App[None]):
         highlighted = None if current_location is None else current_location.coordinates
         # Collected here, on the UI thread: the worker must not read session state that rating may change.
         map_points = None if map_key == self._side_map_key else self._session.collect_map_points()
+        if map_points is not None:
+            self._side_map_points = map_points
         self.run_worker(
             functools.partial(self._render_side_map, map_key, map_points, highlighted, box_size),
             thread=True,

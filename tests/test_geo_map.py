@@ -4,6 +4,7 @@ import json
 import re
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pytest
 
 from lazyrate.geo_map import (
@@ -13,6 +14,7 @@ from lazyrate.geo_map import (
     MapViewport,
     build_town_labels,
     choose_scale_bar_km,
+    find_points_near,
     fit_extent,
 )
 from lazyrate.locations import GeoCoordinates, Place
@@ -113,6 +115,48 @@ def test_panning_and_centering_move_the_visible_area() -> None:
         fitted_extent.max_longitude_deg
     )
     assert MapViewport().zoom(steps=1).zoom(steps=-1).is_fitted
+
+
+def test_dragging_moves_the_map_with_the_mouse() -> None:
+    fitted_extent = fit_extent([FUNCHAL, MUNICH], aspect_ratio=1.5)
+
+    dragged_up_extent = MapViewport().drag(x_ratio_delta=0.0, y_ratio_delta=-0.25).apply(fitted_extent)
+
+    # Grabbing the map and pulling it up brings the south into view.
+    assert dragged_up_extent.min_latitude_deg < fitted_extent.min_latitude_deg
+    assert dragged_up_extent.max_latitude_deg - fitted_extent.max_latitude_deg == pytest.approx(
+        -0.25 * fitted_extent.latitude_span_deg
+    )
+
+
+def test_points_near_a_click_are_found_nearest_first() -> None:
+    extent = fit_extent([FUNCHAL, MUNICH], aspect_ratio=1.0)
+    points = [
+        MapPoint(relative_path="munich.jpg", coordinates=MUNICH, rating=None, place=None),
+        MapPoint(relative_path="funchal_far.jpg", coordinates=FUNCHAL, rating=None, place=None),
+        MapPoint(relative_path="funchal_near.jpg", coordinates=FUNCHAL, rating=None, place=None),
+    ]
+    ((funchal_x_px, funchal_y_px),) = extent.project(
+        longitudes_deg=np.array([FUNCHAL.longitude_deg]),
+        latitudes_deg=np.array([FUNCHAL.latitude_deg]),
+        width_px=400,
+        height_px=400,
+    ).tolist()
+
+    near_paths = find_points_near(
+        points,
+        extent=extent,
+        image_size=(400, 400),
+        x_ratio=(funchal_x_px + 3) / 400,
+        y_ratio=funchal_y_px / 400,
+        max_distance_px=10,
+    )
+    missed_paths = find_points_near(
+        points, extent=extent, image_size=(400, 400), x_ratio=0.5, y_ratio=0.5, max_distance_px=10
+    )
+
+    assert near_paths == ["funchal_far.jpg", "funchal_near.jpg"]
+    assert missed_paths == []
 
 
 def test_zoom_level_is_limited() -> None:
