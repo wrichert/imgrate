@@ -70,6 +70,8 @@ flowchart TD
 - Background decoding + prefetch of the next images, JPEG draft-mode decoding (24 MP → ~25 ms), EXIF orientation, HEIC/HEIF
 - Ratings stored immediately in SQLite (`ROOT/.lazyrate.sqlite`), keyed by path relative to the root, so the folder can be moved
   (a `.imgrate.sqlite` from before the rename to lazyrate is renamed automatically, ratings are kept)
+- Info panel per photo: size, date taken, camera and lens (`NIKON Z 6_2` · `NIKKOR Z 24-70mm f/4 S`, or
+  `Apple iPhone 15 Pro` · `back triple camera 6.86mm f/1.78`), place
 - Sort by path, rating (best first), date taken or place
 - Search by place: GPS positions are read once and named offline (nearest town, region, country from
   [GeoNames](https://www.geonames.org/)); `/madeira`, `/funchal`, `/portugal` or `/@32.75,-16.95 50km`

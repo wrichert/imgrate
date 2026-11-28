@@ -4,6 +4,7 @@ import re
 from typing import TYPE_CHECKING
 
 import numpy as np
+from conftest import save_photo_with_camera
 from PIL import Image
 from textual.content import Content
 from textual.widgets import Input, Static
@@ -657,3 +658,23 @@ async def test_clicking_a_dot_on_the_map_selects_its_photo_and_dragging_pans(geo
     assert selected_path == munich_point.relative_path
     assert dragged_viewport.center_y_ratio > 0  # pulled up: the map moves south
     assert dragged_viewport.zoom_level == 0
+
+
+async def test_info_panel_names_camera_and_lens_in_grid_view(tmp_path: Path) -> None:
+    save_photo_with_camera(
+        tmp_path / "dsc_0001.jpg", maker="NIKON CORPORATION", model="NIKON Z 6_2", lens="NIKKOR Z 50mm"
+    )
+    store = RatingStore(tmp_path / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(tmp_path), store=store)
+    app = ImageRaterApp(session=session, database_path=store.database_path)
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if "NIKON" in str(app.query_one("#info", Static).render()):
+                break
+        info_text = str(app.query_one("#info", Static).render())
+    store.close()
+
+    assert "NIKON Z 6_2" in info_text
+    assert "NIKKOR Z 50mm" in info_text

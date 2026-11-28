@@ -176,3 +176,12 @@ def geo_root(tmp_path: Path) -> Path:
         latitude_deg, longitude_deg, color = gps_data
         save_geotagged_photo(target_path, latitude_deg=latitude_deg, longitude_deg=longitude_deg, color=color)
     return root
+
+
+def save_photo_with_camera(path: Path, *, maker: str, model: str, lens: str | None) -> None:
+    exif = Image.Exif()
+    exif[ExifTags.Base.Make] = maker
+    exif[ExifTags.Base.Model] = model
+    if lens is not None:
+        exif.get_ifd(ExifTags.IFD.Exif)[ExifTags.Base.LensModel] = lens
+    Image.new("RGB", (64, 48), (90, 120, 150)).save(path, exif=exif)

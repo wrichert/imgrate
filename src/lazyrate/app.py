@@ -59,7 +59,7 @@ from lazyrate.learning import (
 )
 from lazyrate.locations import LocationReader, PlaceIndex
 from lazyrate.media import scan_media_files
-from lazyrate.preview import PreviewCache
+from lazyrate.preview import PreviewCache, read_photo_details
 from lazyrate.ratings import ALL_BUCKETS, FILTER_PRESETS, MAX_STARS, REJECTED, describe_bucket, format_stars
 from lazyrate.screens import (
     ExportRequest,
@@ -90,7 +90,7 @@ if TYPE_CHECKING:
     from lazyrate.learning import LearningResult
     from lazyrate.locations import GeoCoordinates, PhotoLocation
     from lazyrate.media import MediaFile, ScanResult
-    from lazyrate.preview import Preview
+    from lazyrate.preview import PhotoDetails, Preview
     from lazyrate.ratings import RatingFilter
     from lazyrate.session import RatingSession
     from lazyrate.suggestions import Suggestion
@@ -387,6 +387,7 @@ class ImageRaterApp(App[None]):
     MAP_CONTROLS_HINT = "Map: wheel or + / - zoom · drag or shift+arrows pan · click a dot selects · * fits all"
     MAP_CLICK_RADIUS_CELLS = 1.0
     """A click this close to a dot (in cell widths) selects its photo."""
+    PHOTO_DETAILS_CACHE_SIZE = 4096
     """Threads report progress at most this many times per task (each report crosses to the UI thread)."""
 
     CSS = """
@@ -524,7 +525,9 @@ class ImageRaterApp(App[None]):
         self._grid_pages: list[GridPage] = []
         self._shown_grid_page: GridPage | None = None
         self._view_refresh_timer: Timer | None = None
-        self._current_preview: Preview | None = None
+        self._photo_details: dict[str, PhotoDetails | None] = {}
+        """Header metadata per relative path (``None``: none readable), filled on demand for the info panel."""
+        self._pending_details_path: str | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="main"):
@@ -1431,21 +1434,55 @@ class ImageRaterApp(App[None]):
         )
         if self._is_suggested_best_of_group(self._session.current_index):
             info_text.append("suggested best of this group (B keeps it)\n", style="green")
-        preview = self._current_preview
-        if preview is not None and preview.original_width_px is not None:
-            info_text.append(f"{preview.original_width_px}×{preview.original_height_px} · ")  # noqa: RUF001
+        details = self._find_photo_details(current_file)
+        if details is not None:
+            info_text.append(f"{details.width_px}×{details.height_px} · ")  # noqa: RUF001
         info_text.append(format_size(current_file.size_bytes))
-        if preview is not None and preview.captured_at:
-            info_text.append(f"\ntaken {preview.captured_at}")
+        if details is not None and details.captured_at:
+            info_text.append(f"\ntaken {details.captured_at}")
         else:
             modified_at = datetime.fromtimestamp(current_file.modified_timestamp_utc).astimezone()
             info_text.append(f"\nmodified {modified_at:%Y-%m-%d %H:%M}", style="dim")
+        if details is not None and details.camera:
+            info_text.append(f"\n{details.camera}")
+        if details is not None and details.lens:
+            info_text.append(f"\n{details.lens}", style="dim")
         location = self._session.get_location(current_file)
         if location is not None and location.place is not None and location.coordinates is not None:
             place = location.place
             info_text.append(f"\n{', '.join(name for name in (place.town, place.region, place.country) if name)}")
             info_text.append(f"\n{location.coordinates}", style="dim")
         return info_text
+
+    def _find_photo_details(self, media_file: MediaFile) -> PhotoDetails | None:
+        """Cached details, or ``None`` while they are read in the background (the info panel refreshes then)."""
+        relative_path = media_file.relative_path
+        if relative_path in self._photo_details:
+            return self._photo_details[relative_path]
+        if self._pending_details_path != relative_path:
+            self._pending_details_path = relative_path
+            self.run_worker(
+                functools.partial(self._read_photo_details, relative_path, self._session.resolve_path(media_file)),
+                thread=True,
+                exclusive=True,
+                group="photo-details",
+            )
+        return None
+
+    def _read_photo_details(self, relative_path: str, path: Path) -> None:
+        details = read_photo_details(path)
+        if not get_current_worker().is_cancelled:
+            self.call_from_thread(self._store_photo_details, relative_path, details)
+
+    def _store_photo_details(self, relative_path: str, details: PhotoDetails | None) -> None:
+        if len(self._photo_details) >= self.PHOTO_DETAILS_CACHE_SIZE:
+            del self._photo_details[next(iter(self._photo_details))]
+        self._photo_details[relative_path] = details
+        if self._pending_details_path == relative_path:
+            self._pending_details_path = None
+        current_file = self._session.current_file
+        if current_file is not None and current_file.relative_path == relative_path:
+            self._refresh_sidebar()
 
     def _build_sections_text(self) -> Text:
         """Window of the section list around the current section."""
@@ -1554,7 +1591,6 @@ class ImageRaterApp(App[None]):
         preview_widget = self.query_one("#preview", ImageWidget)
         placeholder = self.query_one("#placeholder", Static)
         if current_file is None:
-            self._current_preview = None
             preview_widget.image = None
             preview_widget.display = False
             placeholder.display = True
@@ -1569,9 +1605,7 @@ class ImageRaterApp(App[None]):
         preview = await self._preview_cache.get(self._session.resolve_path(current_file), max_edge_px=max_edge_px)
         if self._session.current_file != current_file:
             return
-        self._current_preview = preview
         self._display_preview(preview)
-        self._refresh_sidebar()
 
     async def _show_side_preview(self) -> None:
         current_file = self._session.current_file

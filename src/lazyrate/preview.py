@@ -21,44 +21,110 @@ register_heif_opener()
 
 @dataclass(frozen=True, slots=True)
 class Preview:
-    """A downscaled, orientation-corrected image plus metadata of the original."""
+    """A downscaled, orientation-corrected image (or why there is none)."""
 
     image: Image.Image | None
-    original_width_px: int | None
-    original_height_px: int | None
-    captured_at: str | None
     error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CameraDetails:
+    camera: str | None
+    """``NIKON Z 6_2``, ``Apple iPhone 15 Pro``."""
+    lens: str | None
+    """``NIKKOR Z 24-70mm f/4 S``; for phones without the repeated model name (``back triple camera 6.86mm f/1.78``)."""
+
+
+@dataclass(frozen=True, slots=True)
+class PhotoDetails:
+    """Metadata of the original file, read from its header without decoding the pixels."""
+
+    width_px: int
+    height_px: int
+    captured_at: str | None
+    camera: str | None
+    lens: str | None
+
+
+CAMERA_MAKER_SUFFIXES = ("corporation", "corp.", "corp", "co.,ltd.", "co., ltd.", "co.,ltd", "imaging", "company")
+"""Dropped from the EXIF maker: ``NIKON CORPORATION`` -> ``NIKON``, ``OLYMPUS IMAGING CORP.`` -> ``OLYMPUS``."""
 
 
 def load_preview(path: Path, *, max_edge_px: int) -> Preview:
     """Decode ``path`` downscaled to at most ``max_edge_px`` on its longest edge."""
     if path.suffix.lower() not in IMAGE_EXTENSIONS:
-        return Preview(None, None, None, None, error="no preview for this format — press o to open externally")
+        return Preview(image=None, error="no preview for this format — press o to open externally")
     try:
         with Image.open(path) as source_image:
-            original_width_px, original_height_px = source_image.size
-            captured_at = _read_capture_date(source_image)
             # JPEG: let libjpeg decode at 1/2, 1/4 or 1/8 scale — by far the biggest speedup.
             source_image.draft("RGB", (max_edge_px, max_edge_px))
             oriented_image = ImageOps.exif_transpose(source_image)
             oriented_image.thumbnail((max_edge_px, max_edge_px), Image.Resampling.BILINEAR)
             preview_image = oriented_image.convert("RGB")
     except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError) as error:
-        return Preview(None, None, None, None, error=f"cannot decode: {error}")
-    return Preview(
-        image=preview_image,
-        original_width_px=original_width_px,
-        original_height_px=original_height_px,
-        captured_at=captured_at,
-        error=None,
-    )
+        return Preview(image=None, error=f"cannot decode: {error}")
+    return Preview(image=preview_image, error=None)
 
 
-def _read_capture_date(image: Image.Image) -> str | None:
-    exif = image.getexif()
+def read_photo_details(path: Path) -> PhotoDetails | None:
+    """Size, capture date, camera and lens; ``None`` for videos and unreadable files. About a millisecond."""
+    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+        return None
+    try:
+        with Image.open(path) as image:
+            exif = image.getexif()
+            camera_details = read_camera_details(exif)
+            return PhotoDetails(
+                width_px=image.width,
+                height_px=image.height,
+                captured_at=read_capture_date(exif),
+                camera=camera_details.camera,
+                lens=camera_details.lens,
+            )
+    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError):
+        return None
+
+
+def read_camera_details(exif: Image.Exif) -> CameraDetails:
+    """Camera and lens names from EXIF, without the maker repeated: ``NIKON CORPORATION`` + ``NIKON Z 6_2`` gives
+    ``NIKON Z 6_2``; ``Apple`` + ``iPhone 15 Pro`` gives ``Apple iPhone 15 Pro``."""
     exif_ifd = exif.get_ifd(ExifTags.IFD.Exif)
-    captured_at = exif_ifd.get(ExifTags.Base.DateTimeOriginal) or exif.get(ExifTags.Base.DateTime)
-    return str(captured_at) if captured_at else None
+    maker = shorten_camera_maker(read_exif_text(exif.get(ExifTags.Base.Make)))
+    model = read_exif_text(exif.get(ExifTags.Base.Model))
+    lens = read_exif_text(exif_ifd.get(ExifTags.Base.LensModel))
+    if model and maker and not model.casefold().startswith(maker.casefold()):
+        camera = f"{maker} {model}"
+    else:
+        camera = model or maker
+    if lens and model and lens.casefold().startswith(model.casefold()) and len(lens) > len(model):
+        lens = lens[len(model) :].strip()
+    return CameraDetails(camera=camera, lens=lens)
+
+
+def read_exif_text(value: object) -> str | None:
+    """EXIF strings may be bytes and padded with NULs or spaces; empty means missing."""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    if not isinstance(value, str):
+        return None
+    text = value.strip("\x00 ")
+    return text or None
+
+
+def shorten_camera_maker(maker: str | None) -> str | None:
+    if maker is None:
+        return None
+    for suffix in CAMERA_MAKER_SUFFIXES:
+        if maker.casefold().endswith(" " + suffix):
+            maker = maker[: -len(suffix) - 1].strip()
+    return maker or None
+
+
+def read_capture_date(exif: Image.Exif) -> str | None:
+    captured_at = read_exif_text(exif.get_ifd(ExifTags.IFD.Exif).get(ExifTags.Base.DateTimeOriginal)) or read_exif_text(
+        exif.get(ExifTags.Base.DateTime)
+    )
+    return captured_at
 
 
 class PreviewCache:
