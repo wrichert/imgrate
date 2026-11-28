@@ -36,12 +36,6 @@ class RatingPace:
         self._rating_count += 1
         self._last_rating_monotonic = now_monotonic
 
-    def estimate_remaining_seconds(self, remaining_count: int) -> float | None:
-        ratings_per_minute = self.ratings_per_minute
-        if ratings_per_minute is None:
-            return None
-        return remaining_count / ratings_per_minute * 60
-
 
 def format_duration(seconds: float) -> str:
     """``~40 min``, ``~2 h 10 min``, ``< 1 min``."""
@@ -52,3 +46,11 @@ def format_duration(seconds: float) -> str:
         return f"~{minutes} min"
     hours, remaining_minutes = divmod(minutes, 60)
     return f"~{hours} h" if remaining_minutes == 0 else f"~{hours} h {remaining_minutes} min"
+
+
+def describe_pace(*, ratings_per_minute: float, unrated_count: int) -> str:
+    """``12/min · 340 unrated · ~28 min left``, or ``12/min · all rated`` when nothing is left."""
+    if unrated_count == 0:
+        return f"{ratings_per_minute:.0f}/min · all rated"
+    remaining_seconds = unrated_count / ratings_per_minute * 60
+    return f"{ratings_per_minute:.0f}/min · {unrated_count:,} unrated · {format_duration(remaining_seconds)} left"

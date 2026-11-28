@@ -60,7 +60,7 @@ from lazyrate.learning import (
 )
 from lazyrate.locations import LocationReader, PlaceIndex
 from lazyrate.media import scan_media_files
-from lazyrate.pace import RatingPace, format_duration
+from lazyrate.pace import RatingPace, describe_pace
 from lazyrate.preview import (
     DisplayTarget,
     Preview,
@@ -1578,10 +1578,7 @@ class ImageRaterApp(App[None]):
         if ratings_per_minute is None:
             return ""
         unrated_count = self._session.count_ratings().get(None, 0)
-        remaining_seconds = self._rating_pace.estimate_remaining_seconds(unrated_count) or 0.0
-        return (
-            f"   {ratings_per_minute:.0f}/min · {unrated_count:,} unrated · {format_duration(remaining_seconds)} left"
-        )
+        return "   " + describe_pace(ratings_per_minute=ratings_per_minute, unrated_count=unrated_count)
 
     def _refresh_sidebar(self) -> None:
         if self._find_grid() is None:
