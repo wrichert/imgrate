@@ -401,8 +401,8 @@ async def test_background_learning_suggests_junk_and_hides_progress_when_done(
         )
         settings_text = str(app.query_one("#settings", Static).render())
 
-    assert receipt_label.startswith("junk?")
-    assert "junk ✓" in settings_text
+    assert receipt_label.startswith("rejected?")
+    assert "rejects ✓" in settings_text
 
 
 async def test_y_accepts_and_capital_y_accepts_the_section(mixed_root: Path, color_embedder: ColorEmbedder) -> None:
@@ -416,7 +416,7 @@ async def test_y_accepts_and_capital_y_accepts_the_section(mixed_root: Path, col
     async with app.run_test(size=(160, 50)) as pilot:
         await wait_for_suggestions(app, pilot, session)
         session.set_sort_order(SortOrder.SUGGESTED)
-        junk_section = next(section for section in session.sections if section.label == "suggested junk")
+        junk_section = next(section for section in session.sections if section.label == "suggested rejected")
         session.move_to(junk_section.start_index)
         await pilot.press("y")
         await pilot.press("Y")

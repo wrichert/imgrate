@@ -186,13 +186,13 @@ def build_rating_text(rating: int | None) -> Text:
 
 
 def build_suggestion_text(suggestion: Suggestion) -> Text:
-    """Ghost rating for an unrated photo, e.g. ``★★★★? 80%`` or ``junk? 92%``."""
+    """Ghost rating for an unrated photo, e.g. ``★★★★? 80%`` or ``rejected? 92%``."""
     confidence_text = f" {suggestion.confidence:.0%}"
     suggested_rating = suggestion.suggested_rating
     if suggested_rating is None:
         return Text(f"keeper?{confidence_text}", style="italic dim")
     if suggested_rating == REJECTED:
-        return Text(f"junk?{confidence_text}", style="italic red")
+        return Text(f"rejected?{confidence_text}", style="italic red")
     return Text(f"{'★' * suggested_rating}?{confidence_text}", style="italic dim yellow")
 
 
@@ -1310,7 +1310,7 @@ class ImageRaterApp(App[None]):
         stars_state = (
             "stars ✓" if readiness.is_star_model_ready else f"stars: {readiness.missing_starred_count} more starred"
         )
-        state = f"junk ✓ · {stars_state}"
+        state = f"rejects ✓ · {stars_state}"
         evaluation = result.evaluation
         if evaluation is not None and evaluation.star_within_one_accuracy is not None:
             state += f" · ±1★ {evaluation.star_within_one_accuracy:.0%}"

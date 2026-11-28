@@ -30,7 +30,7 @@ class SortOrder(StrEnum):
     RATING = "rating"
     DATE = "date taken"
     SUGGESTED = "suggested rating"
-    """Unrated photos by the learned suggestion (best first, junk last); needs suggestions."""
+    """Unrated photos by the learned suggestion (best first, rejects last); needs suggestions."""
     INFORMATIVE = "most informative"
     """Unrated photos the model is least sure about first: rating these teaches it the most."""
     PLACE = "place"
@@ -121,12 +121,12 @@ def describe_suggestion(suggestion: Suggestion | None) -> str:
     if suggestion.suggested_rating is None:
         return "suggested keeper"
     if suggestion.suggested_rating == REJECTED:
-        return "suggested junk"
+        return "suggested rejected"
     return f"suggested {describe_bucket(suggestion.suggested_rating)}"
 
 
 def rank_suggestion_for_sort(suggestion: Suggestion | None) -> int:
-    """Suggested ★★★★★ … ★, then keeper (stars unknown), then junk, then no suggestion."""
+    """Suggested ★★★★★ … ★, then keeper (stars unknown), then rejected, then no suggestion."""
     if suggestion is None:
         return MAX_STARS + 3
     if suggestion.suggested_rating is None:
@@ -765,7 +765,7 @@ class RatingSession:
         return describe_suggestion(self._view_suggestions.get(media_file.relative_path))
 
     def _build_suggested_sort_key(self, media_file: MediaFile) -> tuple[int, float]:
-        """Unrated by suggestion (best expected rating first; surest junk first), then rated photos by rating."""
+        """Unrated by suggestion (best expected rating first; surest rejects first), then rated photos by rating."""
         rating = self.get_rating(media_file)
         if rating is not None:
             return (MAX_STARS + 4 + rank_rating_for_sort(rating), 0.0)

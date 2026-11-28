@@ -488,20 +488,20 @@ def print_learning_report(result: LearningResult, store: RatingStore) -> None:
         return
     evaluation = result.evaluation
     if evaluation is None or evaluation.junk_evaluated_count == 0:
-        print("Accuracy:    not measurable yet (each check holds out a fifth of the ratings; rate a few more)")
+        print("Accuracy:     not measurable yet (each check holds out a fifth of the ratings; rate a few more)")
     if evaluation is not None and evaluation.junk_precision is not None and evaluation.junk_recall is not None:
         print(
-            f"Junk model:  precision {evaluation.junk_precision:.0%} · recall {evaluation.junk_recall:.0%} "
+            f"Reject model: precision {evaluation.junk_precision:.0%} · recall {evaluation.junk_recall:.0%} "
             f"(cross-validated on {evaluation.junk_evaluated_count:,} rated photos)"
         )
     if evaluation is not None and evaluation.star_within_one_accuracy is not None:
         print(
-            f"Star model:  exact {evaluation.star_exact_accuracy:.0%} · within ±1 star "
+            f"Star model:   exact {evaluation.star_exact_accuracy:.0%} · within ±1 star "
             f"{evaluation.star_within_one_accuracy:.0%} · mean error {evaluation.star_mean_absolute_error:.2f} stars "
             f"({evaluation.star_evaluated_count:,} starred photos)"
         )
     elif not readiness.is_star_model_ready:
-        print(f"Star model:  needs {readiness.missing_starred_count} more starred photos")
+        print(f"Star model:   needs {readiness.missing_starred_count} more starred photos")
     ratings = store.load_ratings()
     suggestion_counts = Counter(
         describe_suggestion(suggestion)

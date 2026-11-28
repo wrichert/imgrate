@@ -285,7 +285,7 @@ HELP_TEXT = """\
   esc            ends the search
 
 [b]AI suggestions & search[/b]  (optional "ml" install; learns from your own ratings, nothing leaves the computer)
-  y              accept the suggestion for this photo (ghost label, e.g. ★★★★? 80% or junk? 92%)
+  y              accept the suggestion for this photo (ghost label, e.g. ★★★★? 80% or rejected? 92%)
   Y              accept the suggestions of every unrated photo in this section (one undo step)
   B              duplicates mode: keep the suggested best of the group, reject the rest
   /              search by content ("beach sunset", "receipt"); combine with a place: "beach madeira"

@@ -23,7 +23,7 @@ terminals with a graphics protocol (Ghostty, Kitty, WezTerm, iTerm2) they are sh
 | You want to … | lazyrate helps by … |
 | --- | --- |
 | **Pick the 12 best photos of the year for a calendar** (or 50 for a photo book) | fast one-key rating, review only the ★★★★★, one section per month, export the keepers |
-| **Clean up a phone camera roll** | grouping bursts and near duplicates (`b` keeps one), AI flags screenshots, receipts and pocket shots as junk, `Y` rejects them in one go |
+| **Clean up a phone camera roll** | grouping bursts and near duplicates (`b` keeps one), AI suggests rejecting screenshots, receipts and pocket shots, `Y` rejects them in one go |
 | **Curate a trip album or slideshow** | sort by date taken, rate, export ≥ ★★★★ by copy or symlink, flat or with folders |
 | **Find that one photo** | AI text search: `/` → "dog in snow" |
 | **Show all photos from one trip or place** | GPS search, works without AI: `/` → "madeira", "lisbon", "portugal", or `@32.75,-16.95 50km`; one section per town |
@@ -82,7 +82,7 @@ flowchart TD
 - Review any rating bucket (unrated, rejected, ≥ N stars, any combination) in single view or as a thumbnail grid
 - Export from the app (`E`) or the shell, by copy or symlink, flat or with sub folders
 - Choose which file formats take part (images on by default; `.mp4`, `.mov`, RAW etc. off unless you enable them)
-- Optional AI: suggested ratings learned from **your own** ratings (junk 0 and 1–5 stars), "rate where it learns
+- Optional AI: suggested ratings learned from **your own** ratings (rejected 0 and 1–5 stars), "rate where it learns
   most", text search ("beach sunset"), best-of-burst hints — all local, nothing is uploaded
 - Progress bars for everything that runs in the background
 
@@ -240,7 +240,7 @@ What that costs:
 | torch + open_clip (the `ml` extra) | ~600 MB installed | once, at install |
 | CLIP ViT-B/32 weights (`laion2b_s34b_b79k`) | 605 MB, kept in `~/.cache/huggingface` | once, on first AI start |
 | Photo descriptions (embeddings) | ~1 KB per photo, in the folder's `.lazyrate.sqlite` | once per photo, ~400 photos/s on Apple GPUs (MPS); slower on CPU |
-| Junk and star models (the rating regressors) | nothing: plain numpy, trained on your ratings | retrained in well under a second, after every 10 ratings or on `L` |
+| Reject and star models (the rating regressors) | nothing: plain numpy, trained on your ratings | retrained in well under a second, after every 10 ratings or on `L` |
 
 Everything runs locally; no photo or rating leaves your machine. Without the extra, lazyrate works as before and
 the AI keys only tell you how to install it.
@@ -249,7 +249,7 @@ With the extra installed, lazyrate describes every photo once with [CLIP](https:
 (ViT-B/32, LAION-2B weights; ~400 photos/s on an Apple GPU, cached in the database, about 1 KB per photo) and learns
 from the ratings you give:
 
-- a **junk model** (rejected vs. kept): receipts, screenshots, pocket shots are a *kind* of picture, not the
+- a **reject model** (rejected vs. kept): receipts, screenshots, pocket shots are a *kind* of picture, not the
   bottom of the quality scale, so they get their own yes/no model;
 - a **star model** for 1–5 stars (ordinal: predicting 4 for a 5 is a small error, 1 for a 5 a big one).
 
@@ -264,20 +264,20 @@ once you have rejected 10 and starred 10 photos; star suggestions after 30 starr
    counts. The **AI** line in the sidebar says how many more it needs.
 3. It retrains automatically every 10 ratings; `L` retrains now.
 4. Press `s` until the sort says **suggested rating**. Unrated photos are grouped into sections like
-   "suggested ★★★★★" … "suggested junk"; thumbnails show what it thinks.
+   "suggested ★★★★★" … "suggested rejected"; thumbnails show what it thinks.
 5. Accept: `y` for the current photo, `Y` for the whole section (`z` undoes the batch). A good start: `J`/`K` to
-   **suggested junk**, skim it, `Y`.
+   **suggested rejected**, skim it, `Y`.
 6. Make it smarter: `s` to **most informative**, rate a few dozen of those, `L`.
 
 #### What you see
 
-- Unrated thumbnails show a ghost label: `★★★★? 80%`, `junk? 92%`, `keeper? 70%` (stars not learned yet).
-- `s` adds two sorts: **suggested rating** (best suggestions first, surest junk together — `Y` rejects them in one
+- Unrated thumbnails show a ghost label: `★★★★? 80%`, `rejected? 92%`, `keeper? 70%` (stars not learned yet).
+- `s` adds two sorts: **suggested rating** (best suggestions first, surest rejects together — `Y` rejects them in one
   go) and **most informative** (the photos the model is least sure about first: rating these teaches it the most).
 - In duplicates mode the member with the best predicted rating is marked `best?`; `B` keeps it.
 - Your ratings always win: suggestions are stored separately and nothing is rated without a key press.
 - `lazyrate stats` / `classify` report cross-validated accuracy, e.g. "within ±1 star 87%", so you can judge
-  how much to trust it. Expect junk detection to be very good and exact stars to be a matter of taste (±1).
+  how much to trust it. Expect reject suggestions to be very good and exact stars to be a matter of taste (±1).
 
 ### Recipes
 
@@ -293,7 +293,7 @@ once you have rejected 10 and starred 10 photos; star suggestions after 30 starr
 
 1. `d`, `b` through the bursts.
 2. With AI: reject 10 screenshots / receipts / blurry shots and star 10 real photos, sort **suggested rating**,
-   check **suggested junk**, `Y`.
+   check **suggested rejected**, `Y`.
 3. `lazyrate export ROOT ~/to-delete --rating 0 --symlink` collects the rejects for a final look before you delete
    them with your usual tool.
 

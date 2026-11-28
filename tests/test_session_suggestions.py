@@ -47,7 +47,7 @@ def test_suggested_sort_puts_best_first_junk_last_and_rated_after(session: Ratin
         "suggested ★★★★★",
         "suggested ★★★",
         "suggested ★",
-        "suggested junk",
+        "suggested rejected",
         "★★",
     ]
 
@@ -104,7 +104,7 @@ def test_new_suggestions_do_not_reshuffle_until_resort(session: RatingSession) -
     session.refresh_view()
 
     assert order_after_update == order_before
-    assert session.sections[0].label == "suggested junk"
+    assert session.sections[0].label == "suggested rejected"
 
 
 def test_search_shows_best_matches_first_and_clearing_restores_sort(session: RatingSession) -> None:
