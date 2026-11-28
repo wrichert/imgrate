@@ -43,7 +43,7 @@ XMP block; RAW files are never touched). Rejected photos are just marked; to cle
 ```mermaid
 flowchart TD
     folder["Photo folder<br/>thousands of photos"] --> start["lazyrate ~/Pictures/2025"]
-    start -. "background, once per photo" .-> index["Duplicate fingerprints · GPS places<br/>+ AI image descriptions (optional)"]
+    start -. "background, once per photo" .-> index["Duplicate fingerprints · GPS places · camera, lens, date<br/>+ AI image descriptions (optional)"]
     start --> dupes["1 · Clear out bursts<br/>d: duplicate groups · b / B: keep the best"]
     dupes --> pass["2 · Quick pass over the unrated<br/>x: reject · 1–5: stars"]
     pass --> enough{"AI installed and<br/>≥ 10 rejected + ≥ 10 starred?"}
@@ -58,8 +58,9 @@ flowchart TD
 ```
 
 1. **Start** lazyrate on a folder. It scans all sub folders and, in the background (with progress bars),
-   fingerprints every photo for duplicate detection, reads where it was taken (GPS) and — with the AI extra —
-   describes its content once. `/` finds photos by place, coordinates or (AI) description at any point.
+   fingerprints every photo for duplicate detection, reads where, when and with which camera it was taken and —
+   with the AI extra — describes its content once. RAW files take part through their embedded JPEG. `/` finds
+   photos by place, coordinates, camera, date or (AI) description at any point.
 2. **Clear out bursts** in duplicates mode: keep the best shot of each group with one key.
 3. **Rate quickly**: one key per photo, the list doesn't jump while you rate, `z` undoes.
 4. **Let the AI help** (optional): after a few dozen ratings it suggests ratings for the rest; you accept them
@@ -342,6 +343,21 @@ once you have rejected 10 and starred 10 photos; star suggestions after 30 starr
 `/` and describe it ("birthday cake", "boat at sunset"); best matches come first, `esc` ends the search.
 From the shell: `lazyrate search ROOT "birthday cake"`.
 
+**Cull a camera shoot (RAW+JPEG)**
+
+1. `lazyrate /Volumes/SD/DCIM` (or the import folder): each RAW+JPEG pair is one photo; `X` → **sidecars** if the
+   ratings should end up in Lightroom, darktable or Capture One.
+2. `d`: bursts are duplicate groups; in each, `i` for 100 %, `space` to step through the burst at the same spot,
+   `esc`, then `b` on the sharpest.
+3. Quick pass over the rest (`x` / `1`–`5`); the status bar shows how long the rest will take at your pace.
+4. Import into Lightroom & co.: the XMP sidecars carry the ratings (rejected = -1). Or `E` to export ≥ ★★★★,
+   RAW files included.
+
+**Only the phone photos (or only the Nikon)**
+
+`/camera:phone` (or `/camera:nikon`, `/camera:"z 6" 2024`): those photos by month; add a place or a description
+to narrow any search, e.g. `/madeira camera:nikon`. From the shell: `lazyrate search "camera:phone 2024-08"`.
+
 **Trip album from a mixed archive**
 
 1. `/madeira` (or `/@32.75,-16.95 60km`): every photo taken there, one section per town; `m` shows them on a map.
@@ -358,8 +374,10 @@ uv run ruff check . && uv run ruff format .
 
 ## Disclaimer
 
-Use at your own risk. lazyrate only reads your photos and never deletes, moves or modifies them: ratings live in a
-separate SQLite file and export copies or links files without overwriting existing ones. Still, this software comes
+Use at your own risk. lazyrate never deletes or moves your photos. It reads them, keeps ratings in a separate SQLite
+file and exports by copying or linking without overwriting existing files. It writes to your photo folder only if
+you switch on XMP ratings (`X`): sidecar files, or, if you choose so, the XMP block inside JPEGs (written to a temporary
+file first, then swapped in; RAW files are never modified). Still, this software comes
 without any warranty, and the author accepts no liability for lost data or any other damage. Keep a backup of your
 photos.
 
