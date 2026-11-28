@@ -631,12 +631,20 @@ class ImageRaterApp(App[None]):
             self._side_pane_mode = SidePaneMode(saved_side_pane_mode)
         self._apply_view_mode()
         self._refresh_all()
+        self._notify_moved_files()
         self._start_fingerprint_indexing()
         self._start_location_reading()
         self._start_learning_pipeline()
 
     def on_unmount(self) -> None:
         self._preview_cache.shutdown()
+
+    def _notify_moved_files(self) -> None:
+        moved_count = len(self._session.recent_moves)
+        if moved_count == 0:
+            return
+        photos = "photo" if moved_count == 1 else "photos"
+        self.notify(f"{moved_count:,} moved or renamed {photos} kept their rating", timeout=5)
 
     def _report_rating_file_error_from_thread(self, message: str) -> None:
         """Rating file writer thread."""
@@ -1173,6 +1181,7 @@ class ImageRaterApp(App[None]):
         self._finish_progress("scan")
         self._session.replace_scan(scan_result)
         self.notify(f"Found {len(scan_result.files):,} media files")
+        self._notify_moved_files()
         self._refresh_all()
         self._start_fingerprint_indexing()
         self._start_location_reading()

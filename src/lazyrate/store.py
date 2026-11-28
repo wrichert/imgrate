@@ -14,10 +14,13 @@ from lazyrate.embeddings import StoredEmbedding
 from lazyrate.fingerprints import Fingerprint
 from lazyrate.locations import GeoCoordinates, PhotoLocation, Place
 from lazyrate.ratings import MAX_STARS, REJECTED
+from lazyrate.relocation import FileIdentity, KnownFile
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
     from pathlib import Path
+
+    from lazyrate.relocation import FileMove
 
 
 SIGNED_64_BIT_OFFSET = 1 << 64
@@ -95,6 +98,7 @@ class RatingStore:
     DEFAULT_FILE_NAME = ".lazyrate.sqlite"
     _ENABLED_EXTENSIONS_KEY = "enabled_extensions"
     _SIZE_KEYED_TABLES = ("fingerprints", "locations", "embeddings")
+    _FILE_RECORD_TABLES = ("ratings", *_SIZE_KEYED_TABLES)
     _PHOTO_METADATA_COLUMNS = (
         ("camera", "TEXT"),
         ("lens", "TEXT"),
@@ -316,6 +320,39 @@ class RatingStore:
                 (size_bytes, relative_path),
             )
         self._connection.commit()
+
+    def load_known_files(self) -> list[KnownFile]:
+        """Every path with records; size and modification time from the first cache table that has them."""
+        identities: dict[str, FileIdentity] = {}
+        for table in self._SIZE_KEYED_TABLES:
+            rows = self._connection.execute(
+                f"SELECT relative_path, size_bytes, modified_timestamp_utc FROM {table}"
+            ).fetchall()
+            for relative_path, size_bytes, modified_timestamp_utc in rows:
+                identities.setdefault(
+                    relative_path,
+                    FileIdentity(size_bytes=size_bytes, modified_timestamp_utc=modified_timestamp_utc),
+                )
+        rated_paths = [row[0] for row in self._connection.execute("SELECT relative_path FROM ratings").fetchall()]
+        all_paths = sorted(set(identities) | set(rated_paths))
+        return [KnownFile(relative_path=path, identity=identities.get(path)) for path in all_paths]
+
+    def move_file_records(self, file_moves: Iterable[FileMove]) -> None:
+        """Re-key every record of each moved photo; one transaction, so a crash leaves all or nothing moved."""
+        with self._connection:
+            for file_move in file_moves:
+                for table in self._FILE_RECORD_TABLES:
+                    self._connection.execute(
+                        f"UPDATE OR REPLACE {table} SET relative_path = ? WHERE relative_path = ?",
+                        (file_move.new_relative_path, file_move.old_relative_path),
+                    )
+
+    def delete_file_records(self, relative_paths: Iterable[str]) -> None:
+        """Forget photos entirely: rating, fingerprint, metadata and AI description."""
+        path_rows = [(relative_path,) for relative_path in relative_paths]
+        with self._connection:
+            for table in self._FILE_RECORD_TABLES:
+                self._connection.executemany(f"DELETE FROM {table} WHERE relative_path = ?", path_rows)
 
     def close(self) -> None:
         self._connection.close()

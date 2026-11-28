@@ -79,6 +79,8 @@ flowchart TD
   the camera or another program are taken over for unrated photos
 - Ratings stored immediately in SQLite (`ROOT/.lazyrate.sqlite`), keyed by path relative to the root, so the folder can be moved
   (a `.imgrate.sqlite` from before the rename to lazyrate is renamed automatically, ratings are kept)
+- Photos moved or renamed inside the folder keep their rating (see [Moving and renaming photos](#moving-and-renaming-photos));
+  `lazyrate prune` forgets photos that are gone
 - Info panel per photo: size, date taken, camera and lens (`NIKON Z 6_2` · `NIKKOR Z 24-70mm f/4 S`, or
   `Apple iPhone 15 Pro` · `back triple camera 6.86mm f/1.78`), place
 - Sort by path, rating (best first), date taken or place
@@ -122,7 +124,8 @@ uv sync && uv run lazyrate ~/Pictures/2025              # add --extra ml for the
 ```sh
 lazyrate ~/Pictures/2025                       # rate (TUI)
 lazyrate                                       # ... the current folder (also for stats, classify, search, map)
-lazyrate stats ~/Pictures/2025                 # counts per rating
+lazyrate stats ~/Pictures/2025                 # counts per rating (and photos no longer on disk)
+lazyrate prune ~/Pictures/2025 [--dry-run]     # forget photos no longer on disk (rating, metadata, AI index)
 lazyrate export ~/Pictures/2025 ~/calendar --min-rating 4 [--flat] [--symlink] [--dry-run]  # 4 and 5 stars
 lazyrate export ~/Pictures/2025 ~/maybe --rating 3            # exactly 3 stars (repeatable; 0 = rejected)
 lazyrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.g. read-only folder)
@@ -252,7 +255,7 @@ digiKam, Capture One and Bridge read (`xmp:Rating`, rejected = -1):
 
 | Mode | Where | Renaming / moving files |
 | --- | --- | --- |
-| off (default) | only the database | ratings are lost for renamed files |
+| off (default) | only the database | kept when moved inside the folder with the file date unchanged (see below) |
 | sidecars | `DSC_1234.xmp` next to the photo; an existing sidecar (e.g. with Lightroom edits) only gets its rating changed | kept if the sidecar is renamed too (Lightroom, Capture One do that) |
 | inside JPEGs | the JPEG's XMP block (lossless, picture unchanged, file date kept); RAW, HEIC and others get sidecars | kept: the rating travels with the file |
 
@@ -260,6 +263,19 @@ Switching on writes every existing rating once; files are written in the backgro
 ones when you quit). Filtering and sorting always use the database, so neither mode slows them down. The other way
 round, ratings found in sidecars or inside the files (set in the camera, in Lightroom, or by lazyrate on another
 computer) are taken over for photos that have no lazyrate rating yet; lazyrate's own rating wins.
+
+### Moving and renaming photos
+
+The database keys photos by their path inside the rated folder. When a photo vanishes from one path and a photo with
+the same size, file date and format appears at another, lazyrate takes it as moved: its rating, fingerprint,
+metadata and AI index follow it, on start and on rescan (`r`), and a notification says how many. `mv`, Finder and
+most photo tools keep the file date; copying without it (`cp` without `-p`) makes a new, unrated photo. If several
+vanished and new photos share size and date, none of them is matched. Moving a photo into another rated folder
+(its own `.lazyrate.sqlite`) does not carry the rating over, unless it is in the file (XMP, below).
+
+Records of photos that are gone for good stay in the database and do no harm; `lazyrate stats` counts them,
+`lazyrate prune` (`--dry-run` to list first) forgets them. Run it only when every sub folder and disk is there: a
+photo on an unmounted drive counts as gone.
 
 ### AI suggestions (optional)
 

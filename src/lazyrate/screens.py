@@ -353,7 +353,8 @@ HELP_TEXT = """\
   q              quit
 
 Ratings are saved immediately to the SQLite file shown in the sidebar; ratings stored in the files (camera,
-Lightroom: XMP) are taken over for photos without a lazyrate rating. After 10 ratings the status bar shows your
+Lightroom: XMP) are taken over for photos without a lazyrate rating. Photos moved or renamed inside the
+folder (same size and file date) keep their rating. After 10 ratings the status bar shows your
 pace and the time left for the unrated photos.
 Export from the shell:  lazyrate export ROOT DEST --rating 5   (repeatable; or --min-rating 4)
 """

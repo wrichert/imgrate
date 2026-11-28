@@ -32,6 +32,7 @@ from lazyrate.learning import (
 from lazyrate.locations import LocationReader, PlaceIndex, find_files_missing_locations
 from lazyrate.media import scan_media_files
 from lazyrate.ratings import ALL_BUCKETS, MAX_STARS, REJECTED, describe_bucket
+from lazyrate.relocation import find_vanished_paths, relocate_moved_files
 from lazyrate.search_filters import (
     PhotoFilterFacts,
     build_filter_result,
@@ -52,7 +53,7 @@ if TYPE_CHECKING:
 
 CURRENT_FOLDER = Path()
 SUBCOMMANDS_WITH_QUERY = frozenset({"search", "map"})
-SUBCOMMANDS = frozenset({"rate", "stats", "export", "classify", "search", "map"})
+SUBCOMMANDS = frozenset({"rate", "stats", "export", "classify", "search", "map", "prune"})
 ML_INSTALL_HINT = "install the AI extra: uv tool install 'lazyrate[ml] @ git+https://github.com/wrichert/lazyrate'"
 PROGRESS_BAR_WIDTH = 30
 DEFAULT_TEXT_SEARCH_LIMIT = 20
@@ -125,6 +126,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     map_parser.add_argument("--no-open", action="store_true", help="only write the file, do not open the browser")
     _add_database_argument(map_parser)
+
+    prune_parser = subparsers.add_parser(
+        "prune", help="forget photos no longer in the folder (ratings, metadata, AI index); moved photos are kept"
+    )
+    prune_parser.add_argument("root", type=Path, nargs="?", default=CURRENT_FOLDER, help="default: .")
+    prune_parser.add_argument("--dry-run", action="store_true", help="only list what would be forgotten")
+    _add_database_argument(prune_parser)
     return parser
 
 
@@ -159,6 +167,8 @@ def main(argv: list[str] | None = None) -> int:
             return run_search(root=root, store=store, parsed=parsed)
         if parsed.command == "map":
             return run_map(root=root, store=store, parsed=parsed)
+        if parsed.command == "prune":
+            return run_prune(root=root, store=store, is_dry_run=parsed.dry_run)
         return run_export(root=root, store=store, parsed=parsed)
     finally:
         store.close()
@@ -205,12 +215,13 @@ def run_tui(*, root: Path, database_path: Path, is_ai_enabled: bool) -> int:
 
 
 def run_stats(*, root: Path, store: RatingStore) -> int:
+    scan_result = scan_and_relocate(root=root, store=store)
     print_rating_counts(store)
     print_location_counts(store)
+    print_vanished_count(store=store, scan_result=scan_result)
     embeddings = store.load_embeddings(ClipEmbedder.MODEL_NAME)
     if not embeddings:
         return 0
-    scan_result = scan_media_files(root)
     embedding_matrix = build_current_embedding_matrix(files=scan_result.files, embeddings=embeddings)
     print()
     print_learning_report(train_and_predict(embedding_matrix=embedding_matrix, ratings=store.load_ratings()), store)
@@ -221,10 +232,62 @@ def run_classify(*, root: Path, store: RatingStore) -> int:
     if not is_embedding_available():
         print(f"lazyrate: classify needs the AI extra; {ML_INSTALL_HINT}", file=sys.stderr)
         return 2
-    scan_result = scan_media_files(root)
+    scan_result = scan_and_relocate(root=root, store=store)
     embedding_matrix = index_embeddings(root=root, store=store, scan_result=scan_result, embedder=ClipEmbedder())
     print_learning_report(train_and_predict(embedding_matrix=embedding_matrix, ratings=store.load_ratings()), store)
     return 0
+
+
+def run_prune(*, root: Path, store: RatingStore, is_dry_run: bool) -> int:
+    """Forget photos no longer in the folder (after moves were matched): rating, metadata, AI description."""
+    scan_result = scan_and_relocate(root=root, store=store)
+    vanished_files = find_vanished_files(store=store, scan_result=scan_result)
+    for relative_path in vanished_files.relative_paths:
+        print(relative_path)
+    verb = "would forget" if is_dry_run else "forgot"
+    print(
+        f"{verb} {len(vanished_files.relative_paths):,} photos no longer in {root} "
+        f"({vanished_files.rated_count:,} of them rated)",
+        file=sys.stderr,
+    )
+    if not is_dry_run:
+        store.delete_file_records(vanished_files.relative_paths)
+    return 0
+
+
+@dataclass(frozen=True, slots=True)
+class VanishedFiles:
+    relative_paths: list[str]
+    rated_count: int
+
+
+def find_vanished_files(*, store: RatingStore, scan_result: ScanResult) -> VanishedFiles:
+    """Photos the database knows that are no longer in the folder (moves already matched)."""
+    vanished_paths = find_vanished_paths(known_files=store.load_known_files(), current_files=scan_result.files)
+    rated_paths = set(store.load_ratings())
+    return VanishedFiles(
+        relative_paths=vanished_paths,
+        rated_count=sum(1 for relative_path in vanished_paths if relative_path in rated_paths),
+    )
+
+
+def scan_and_relocate(*, root: Path, store: RatingStore) -> ScanResult:
+    """Scan the folder; photos moved or renamed since the last run keep their rating and cached data."""
+    scan_result = scan_media_files(root)
+    file_moves = relocate_moved_files(store=store, current_files=scan_result.files)
+    if file_moves:
+        print(f"lazyrate: {len(file_moves):,} moved or renamed photos kept their rating", file=sys.stderr)
+    return scan_result
+
+
+def print_vanished_count(*, store: RatingStore, scan_result: ScanResult) -> None:
+    vanished_files = find_vanished_files(store=store, scan_result=scan_result)
+    if not vanished_files.relative_paths:
+        return
+    print(
+        f"gone      {len(vanished_files.relative_paths):>7,} photos no longer on disk "
+        f"({vanished_files.rated_count:,} rated); `lazyrate prune` forgets them"
+    )
 
 
 class SearchError(Exception):
@@ -244,7 +307,7 @@ def run_search(*, root: Path, store: RatingStore, parsed: argparse.Namespace) ->
         query = build_query_text(parsed)
         if query is None:
             raise SearchError("give a search query or --near LAT,LON")
-        scan_result = scan_media_files(root)
+        scan_result = scan_and_relocate(root=root, store=store)
         locations = index_locations(root=root, store=store, scan_result=scan_result)
         resolved_search = resolve_search(
             query=query, root=root, store=store, scan_result=scan_result, locations=locations
@@ -262,7 +325,7 @@ def run_map(*, root: Path, store: RatingStore, parsed: argparse.Namespace) -> in
     """All photos with GPS data, or the matches of a search, on a browser map."""
     try:
         query = build_query_text(parsed)
-        scan_result = scan_media_files(root)
+        scan_result = scan_and_relocate(root=root, store=store)
         locations = index_locations(root=root, store=store, scan_result=scan_result)
         if query is None:
             matching_paths = [path for path, location in locations.items() if location.coordinates is not None]
@@ -459,6 +522,7 @@ def run_export(*, root: Path, store: RatingStore, parsed: argparse.Namespace) ->
             file=sys.stderr,
         )
         return 2
+    scan_and_relocate(root=root, store=store)
     relative_paths = [path for path, rating in store.load_ratings().items() if rating in selected_ratings]
     try:
         summary = export_files(

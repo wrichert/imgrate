@@ -21,6 +21,7 @@ from lazyrate.media import (
     find_raw_companions,
 )
 from lazyrate.ratings import ALL_FILTER, MAX_STARS, REJECTED, RatingBucket, RatingFilter, describe_bucket
+from lazyrate.relocation import relocate_moved_files
 from lazyrate.search_filters import PhotoFilterFacts
 from lazyrate.store import RatingStore
 from lazyrate.xmp import RatingFileMode, RatingFileWriter
@@ -31,6 +32,7 @@ if TYPE_CHECKING:
 
     from lazyrate.fingerprints import Fingerprint
     from lazyrate.locations import PhotoLocation
+    from lazyrate.relocation import FileMove
     from lazyrate.suggestions import Suggestion
 
 
@@ -186,6 +188,7 @@ class RatingSession:
         self._scan_result = scan_result
         self._store = store
         self._duplicate_finder = duplicate_finder or DuplicateFinder()
+        self._recent_moves = relocate_moved_files(store=store, current_files=scan_result.files)
         self._ratings = store.load_ratings()
         self._rating_file_writer: RatingFileWriter | None = None
         self._writer_thread_store: RatingStore | None = None
@@ -233,6 +236,11 @@ class RatingSession:
         )
 
     # -------------------------------------------------------------- properties
+
+    @property
+    def recent_moves(self) -> list[FileMove]:
+        """Photos moved or renamed outside lazyrate, found by the last scan; their ratings moved with them."""
+        return list(self._recent_moves)
 
     @property
     def root(self) -> Path:
@@ -686,6 +694,11 @@ class RatingSession:
         if scan_result.root != self._scan_result.root:
             raise ValueError(f"Rescan root {scan_result.root} differs from {self._scan_result.root}")
         self._scan_result = scan_result
+        self._recent_moves = relocate_moved_files(store=self._store, current_files=scan_result.files)
+        if self._recent_moves:
+            self._ratings = self._store.load_ratings()
+            self._fingerprints = self._store.load_fingerprints()
+            self._locations = self._store.load_locations()
         self._refresh_raw_companions()
         self._fingerprints = self._select_current_fingerprints(self._fingerprints)
         self._locations = self._select_current_locations(self._locations)
