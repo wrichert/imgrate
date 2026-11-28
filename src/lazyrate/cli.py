@@ -43,6 +43,8 @@ if TYPE_CHECKING:
     from lazyrate.locations import PhotoLocation
     from lazyrate.media import ScanResult
 
+CURRENT_FOLDER = Path()
+SUBCOMMANDS_WITH_QUERY = frozenset({"search", "map"})
 SUBCOMMANDS = frozenset({"rate", "stats", "export", "classify", "search", "map"})
 ML_INSTALL_HINT = "install the AI extra: uv tool install 'lazyrate[ml] @ git+https://github.com/wrichert/lazyrate'"
 PROGRESS_BAR_WIDTH = 30
@@ -54,12 +56,12 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     rate_parser = subparsers.add_parser("rate", help="open the rating TUI (default command)")
-    rate_parser.add_argument("root", type=Path, help="photo folder")
+    rate_parser.add_argument("root", type=Path, nargs="?", default=CURRENT_FOLDER, help="photo folder (default: .)")
     rate_parser.add_argument("--no-ai", action="store_true", help="no AI suggestions / search even if installed")
     _add_database_argument(rate_parser)
 
     stats_parser = subparsers.add_parser("stats", help="print rating counts (and AI accuracy, if indexed)")
-    stats_parser.add_argument("root", type=Path)
+    stats_parser.add_argument("root", type=Path, nargs="?", default=CURRENT_FOLDER, help="default: .")
     _add_database_argument(stats_parser)
 
     export_parser = subparsers.add_parser("export", help="copy or link rated files to a folder")
@@ -82,13 +84,13 @@ def build_parser() -> argparse.ArgumentParser:
     classify_parser = subparsers.add_parser(
         "classify", help="index image content, learn from your ratings, report accuracy and suggestions (AI)"
     )
-    classify_parser.add_argument("root", type=Path)
+    classify_parser.add_argument("root", type=Path, nargs="?", default=CURRENT_FOLDER, help="default: .")
     _add_database_argument(classify_parser)
 
     search_parser = subparsers.add_parser(
         "search", help="find photos by place (GPS), coordinates, or text description (AI)"
     )
-    search_parser.add_argument("root", type=Path)
+    search_parser.add_argument("root", nargs="?", default=None, help="photo folder (default: .)")
     search_parser.add_argument(
         "query",
         nargs="?",
@@ -108,7 +110,7 @@ def build_parser() -> argparse.ArgumentParser:
     map_parser = subparsers.add_parser(
         "map", help="open a browser map of all photos with GPS data, or of a search's matches"
     )
-    map_parser.add_argument("root", type=Path)
+    map_parser.add_argument("root", nargs="?", default=None, help="photo folder (default: .)")
     map_parser.add_argument("query", nargs="?", default=None, help="optional search, same forms as `search`")
     _add_near_arguments(map_parser)
     map_parser.add_argument(
@@ -122,14 +124,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
     parser = build_parser()
-    if not arguments:
-        parser.print_usage(sys.stderr)
-        print("lazyrate: error: photo folder missing, e.g. `lazyrate ~/Pictures/2025`", file=sys.stderr)
-        return 2
-    # `lazyrate ~/Photos` is shorthand for `lazyrate rate ~/Photos`.
-    if arguments[0] not in SUBCOMMANDS and arguments[0] not in {"-h", "--help"}:
+    # `lazyrate ~/Photos` is shorthand for `lazyrate rate ~/Photos`, plain `lazyrate` rates the current folder.
+    if not arguments or (arguments[0] not in SUBCOMMANDS and arguments[0] not in {"-h", "--help"}):
         arguments = ["rate", *arguments]
     parsed = parser.parse_args(arguments)
+    if parsed.command in SUBCOMMANDS_WITH_QUERY:
+        search_target = resolve_search_target(first_argument=parsed.root, query=parsed.query)
+        parsed = argparse.Namespace(**{**vars(parsed), "root": search_target.root, "query": search_target.query})
     root = parsed.root.expanduser().resolve()
     if not root.is_dir():
         print(f"lazyrate: not a directory: {root}", file=sys.stderr)
@@ -154,6 +155,23 @@ def main(argv: list[str] | None = None) -> int:
         return run_export(root=root, store=store, parsed=parsed)
     finally:
         store.close()
+
+
+@dataclass(frozen=True, slots=True)
+class SearchTarget:
+    root: Path
+    query: str | None
+
+
+def resolve_search_target(*, first_argument: str | None, query: str | None) -> SearchTarget:
+    """``lazyrate search madeira`` searches the current folder: a first word that is no folder (and does not look
+    like a path) belongs to the query."""
+    if first_argument is None:
+        return SearchTarget(root=CURRENT_FOLDER, query=query)
+    looks_like_path = first_argument.startswith(("/", "~", ".")) or "/" in first_argument
+    if looks_like_path or Path(first_argument).expanduser().is_dir():
+        return SearchTarget(root=Path(first_argument), query=query)
+    return SearchTarget(root=CURRENT_FOLDER, query=first_argument if query is None else f"{first_argument} {query}")
 
 
 def run_tui(*, root: Path, database_path: Path, is_ai_enabled: bool) -> int:

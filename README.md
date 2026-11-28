@@ -110,12 +110,14 @@ uv sync && uv run lazyrate ~/Pictures/2025              # add --extra ml for the
 
 ```sh
 lazyrate ~/Pictures/2025                       # rate (TUI)
+lazyrate                                       # ... the current folder (also for stats, classify, search, map)
 lazyrate stats ~/Pictures/2025                 # counts per rating
 lazyrate export ~/Pictures/2025 ~/calendar --min-rating 4 [--flat] [--symlink] [--dry-run]  # 4 and 5 stars
 lazyrate export ~/Pictures/2025 ~/maybe --rating 3            # exactly 3 stars (repeatable; 0 = rejected)
 lazyrate rate ~/Pictures/2025 --db ~/ratings.sqlite   # keep the DB elsewhere (e.g. read-only folder)
 lazyrate classify ~/Pictures/2025              # AI: index, learn from your ratings, report accuracy + suggestions
 lazyrate search ~/Pictures/2025 madeira        # all photos taken in Madeira (GPS), grouped by town
+lazyrate search funchal                        # ... in the current folder (a word that is no sub folder is the query)
 lazyrate search ~/Pictures/2025 --near=32.75,-16.95 --radius 50   # within 50 km, nearest first
 lazyrate map ~/Pictures/2025                   # browser map of all photos with GPS data
 lazyrate map ~/Pictures/2025 madeira           # ... of a search's matches (any search form; --output, --no-open)

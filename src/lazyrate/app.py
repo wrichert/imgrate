@@ -9,6 +9,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -218,6 +219,40 @@ class SideMapKey:
 
 
 @dataclass(frozen=True, slots=True)
+class DaemonCallResult[ValueType]:
+    value: ValueType | None
+    error: Exception | None
+    is_stopped: bool
+    """``should_stop`` became true before the call finished; it goes on in the background, its result is dropped."""
+
+
+def call_in_daemon_thread[ValueType](
+    function: Callable[[], ValueType], *, should_stop: Callable[[], bool], poll_interval_seconds: float = 0.1
+) -> DaemonCallResult[ValueType]:
+    """Run ``function`` in a daemon thread and wait for it, but give up as soon as ``should_stop()`` is true."""
+    outcome: dict[str, object] = {}
+    thread = threading.Thread(target=run_and_record, args=(function, outcome), name="lazyrate-daemon-call", daemon=True)
+    thread.start()
+    while thread.is_alive():
+        if should_stop():
+            return DaemonCallResult(value=None, error=None, is_stopped=True)
+        thread.join(poll_interval_seconds)
+    error = outcome.get("error")
+    return DaemonCallResult(
+        value=outcome.get("value"),  # type: ignore[arg-type]
+        error=error if isinstance(error, Exception) else None,
+        is_stopped=False,
+    )
+
+
+def run_and_record(function: Callable[[], object], outcome: dict[str, object]) -> None:
+    try:
+        outcome["value"] = function()
+    except Exception as error:
+        outcome["error"] = error
+
+
+@dataclass(frozen=True, slots=True)
 class PanePosition:
     """A point in a pane as 0..1 of its width and height, from the top left."""
 
@@ -388,6 +423,7 @@ class ImageRaterApp(App[None]):
     MAP_CLICK_RADIUS_CELLS = 1.0
     """A click this close to a dot (in cell widths) selects its photo."""
     PHOTO_DETAILS_CACHE_SIZE = 4096
+    INFO_MIN_LINE_WIDTH = 16
     """Threads report progress at most this many times per task (each report crosses to the UI thread)."""
 
     CSS = """
@@ -407,6 +443,7 @@ class ImageRaterApp(App[None]):
     .thumbnail-label { width: 100%; height: 1; content-align: center middle; }
     #sidebar { width: 34; border-left: vkey $panel; padding: 0 1; }
     #sidebar Static { margin-bottom: 1; }
+    #info { text-wrap: nowrap; text-overflow: ellipsis; }
     #side-preview { height: 1fr; align: center middle; display: none; }
     #side-preview-image { width: auto; height: auto; }
     #sidebar.-preview { width: 50%; }
@@ -1182,15 +1219,22 @@ class ImageRaterApp(App[None]):
         """Worker thread. Loading CLIP can fail in many ways (download, torch backend), so report them all."""
         if self._embedder is not None or self._embedder_factory is None:
             return self._embedder
+        worker = get_current_worker()
         self.call_from_thread(
             self._start_progress, "model", title="Loading AI model (first run downloads ~600 MB)", total=None
         )
-        try:
-            self._embedder = self._embedder_factory()
-        except (ImportError, OSError, RuntimeError, ValueError) as error:
-            self.call_from_thread(self._handle_learning_failed, f"AI model unavailable: {error}")
-        finally:
-            self.call_from_thread(self._finish_progress, "model")
+        # Importing torch and loading the weights takes seconds and cannot be interrupted; in a daemon thread it
+        # does not keep the app from quitting (Textual's worker threads are waited for at exit).
+        loading = call_in_daemon_thread(self._embedder_factory, should_stop=lambda: worker.is_cancelled)
+        if loading.is_stopped:
+            return None
+        self.call_from_thread(self._finish_progress, "model")
+        if isinstance(loading.error, (ImportError, OSError, RuntimeError, ValueError)):
+            self.call_from_thread(self._handle_learning_failed, f"AI model unavailable: {loading.error}")
+            return None
+        if loading.error is not None:
+            raise loading.error
+        self._embedder = loading.value
         return self._embedder
 
     def _handle_learning_failed(self, message: str) -> None:
@@ -1417,42 +1461,49 @@ class ImageRaterApp(App[None]):
         self.query_one("#settings", Static).update(self._build_settings_text())
 
     def _build_info_text(self) -> Text:
+        """One line per field, empty when unknown, never wrapped: the panel keeps its height from photo to photo, so
+        nothing below (or the preview / map above) jumps while flipping through photos."""
         current_file = self._session.current_file
         if current_file is None:
             if self._session.is_duplicates_mode:
                 return Text(f"No duplicate groups in this view.\n{self._describe_duplicates_state()}", style="dim")
             return Text("No files match.\nv / f: change view\ne: change formats", style="dim")
+        line_width = max(self.query_one("#info").content_size.width, self.INFO_MIN_LINE_WIDTH)
         folder, _, file_name = current_file.relative_path.rpartition("/")
-        info_text = Text.assemble(
-            (file_name, "bold"),
-            "\n",
-            (folder or ".", "dim"),
-            "\n\n",
-            build_rating_text(self._session.current_rating),
-            self._build_suggestion_hint(current_file),
-            "\n",
-        )
-        if self._is_suggested_best_of_group(self._session.current_index):
-            info_text.append("suggested best of this group (B keeps it)\n", style="green")
         details = self._find_photo_details(current_file)
-        if details is not None:
-            info_text.append(f"{details.width_px}×{details.height_px} · ")  # noqa: RUF001
-        info_text.append(format_size(current_file.size_bytes))
+        location = self._session.get_location(current_file)
+        place = None if location is None else location.place
+        lines = [
+            Text(file_name, style="bold"),
+            Text(truncate_from_left(folder or ".", max_length=line_width), style="dim"),
+            Text(""),
+            Text.assemble(build_rating_text(self._session.current_rating), self._build_suggestion_hint(current_file)),
+        ]
+        if self._session.is_duplicates_mode:
+            is_best = self._is_suggested_best_of_group(self._session.current_index)
+            lines.append(Text("suggested best of this group (B keeps it)" if is_best else "", style="green"))
+        size_text = format_size(current_file.size_bytes)
+        lines.append(Text(size_text if details is None else f"{details.width_px}×{details.height_px} · {size_text}"))  # noqa: RUF001
         if details is not None and details.captured_at:
-            info_text.append(f"\ntaken {details.captured_at}")
+            lines.append(Text(f"taken {details.captured_at}"))
         else:
             modified_at = datetime.fromtimestamp(current_file.modified_timestamp_utc).astimezone()
-            info_text.append(f"\nmodified {modified_at:%Y-%m-%d %H:%M}", style="dim")
-        if details is not None and details.camera:
-            info_text.append(f"\n{details.camera}")
-        if details is not None and details.lens:
-            info_text.append(f"\n{details.lens}", style="dim")
-        location = self._session.get_location(current_file)
-        if location is not None and location.place is not None and location.coordinates is not None:
-            place = location.place
-            info_text.append(f"\n{', '.join(name for name in (place.town, place.region, place.country) if name)}")
-            info_text.append(f"\n{location.coordinates}", style="dim")
-        return info_text
+            lines.append(Text(f"modified {modified_at:%Y-%m-%d %H:%M}", style="dim"))
+        camera = details.camera if details is not None else None
+        lens = details.lens if details is not None else None
+        place_text = (
+            "" if place is None else ", ".join(name for name in (place.town, place.region, place.country) if name)
+        )
+        coordinates = None if location is None else location.coordinates
+        lines.extend(
+            [
+                Text(camera or ""),
+                Text(lens or "", style="dim"),
+                Text(place_text),
+                Text("" if coordinates is None else str(coordinates), style="dim"),
+            ]
+        )
+        return Text("\n").join(lines)
 
     def _find_photo_details(self, media_file: MediaFile) -> PhotoDetails | None:
         """Cached details, or ``None`` while they are read in the background (the info panel refreshes then)."""

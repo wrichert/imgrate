@@ -1,16 +1,13 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from pathlib import Path
 
-from lazyrate.cli import main
+import pytest
+
+from lazyrate.cli import main, resolve_search_target
 from lazyrate.export import build_unique_flat_name
 from lazyrate.geo_map import BROWSER_MAP_FILE_NAME
 from lazyrate.store import RatingStore
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
 
 
 def test_export_copies_only_files_at_or_above_min_rating(photo_root: Path, tmp_path: Path) -> None:
@@ -69,13 +66,53 @@ def test_export_rejects_out_of_range_rating(photo_root: Path, tmp_path: Path) ->
     assert main(["export", str(photo_root), str(tmp_path / "x"), "--rating", "7"]) == 2
 
 
-def test_missing_photo_folder_is_an_error_instead_of_scanning_the_current_directory(
-    capsys: pytest.CaptureFixture[str],
+def test_without_a_folder_the_current_directory_is_used(
+    geo_root: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    monkeypatch.chdir(geo_root)
+
+    stats_exit_code = main(["stats"])
+    capsys.readouterr()
+    search_exit_code = main(["search", "funchal"])  # "madeira" would be its sub folder
+    search_output = capsys.readouterr().out
+
+    assert stats_exit_code == 0
+    assert (geo_root / RatingStore.DEFAULT_FILE_NAME).is_file()
+    assert search_exit_code == 0
+    assert search_output.count("madeira/funchal_") == 2
+
+
+def test_plain_lazyrate_rates_the_current_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.chdir(tmp_path)
+    opened_roots: list[Path] = []
+    monkeypatch.setattr(
+        "lazyrate.cli.run_tui",
+        lambda *, root, database_path, is_ai_enabled: opened_roots.append(root) or 0,
+    )
+
     exit_code = main([])
 
-    assert exit_code == 2
-    assert "photo folder missing" in capsys.readouterr().err
+    assert exit_code == 0
+    assert opened_roots == [tmp_path.resolve()]
+
+
+@pytest.mark.parametrize(
+    ("first_argument", "query", "expected_root", "expected_query"),
+    [
+        (None, None, Path(), None),
+        ("madeira", None, Path(), "madeira"),
+        ("beach", "madeira", Path(), "beach madeira"),
+        ("~/Pictures/2025", "madeira", Path("~/Pictures/2025"), "madeira"),
+        ("./trip", None, Path("./trip"), None),
+    ],
+)
+def test_search_arguments_without_a_folder_are_the_query(
+    first_argument: str | None, query: str | None, expected_root: Path, expected_query: str | None
+) -> None:
+    search_target = resolve_search_target(first_argument=first_argument, query=query)
+
+    assert search_target.root == expected_root
+    assert search_target.query == expected_query
 
 
 def test_legacy_imgrate_database_is_renamed_and_keeps_ratings(photo_root: Path) -> None:

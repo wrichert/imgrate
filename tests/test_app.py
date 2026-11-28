@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import threading
+import time
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -9,7 +11,14 @@ from PIL import Image
 from textual.content import Content
 from textual.widgets import Input, Static
 
-from lazyrate.app import ImageRaterApp, SectionHeader, SidePaneMode, ThumbnailCell, fit_image_to_cells
+from lazyrate.app import (
+    ImageRaterApp,
+    SectionHeader,
+    SidePaneMode,
+    ThumbnailCell,
+    call_in_daemon_thread,
+    fit_image_to_cells,
+)
 from lazyrate.geo_map import BROWSER_MAP_FILE_NAME, Basemap
 from lazyrate.media import scan_media_files
 from lazyrate.ratings import REJECTED
@@ -678,3 +687,44 @@ async def test_info_panel_names_camera_and_lens_in_grid_view(tmp_path: Path) -> 
 
     assert "NIKON Z 6_2" in info_text
     assert "NIKKOR Z 50mm" in info_text
+
+
+def test_daemon_call_returns_the_value_or_the_error() -> None:
+    finished_call = call_in_daemon_thread(lambda: 42, should_stop=lambda: False)
+    failed_call = call_in_daemon_thread(lambda: int("x"), should_stop=lambda: False)
+
+    assert (finished_call.value, finished_call.error, finished_call.is_stopped) == (42, None, False)
+    assert isinstance(failed_call.error, ValueError)
+
+
+def test_daemon_call_gives_up_without_waiting_when_asked_to_stop() -> None:
+    release_event = threading.Event()
+    started_at = time.perf_counter()
+
+    stopped_call = call_in_daemon_thread(release_event.wait, should_stop=lambda: True, poll_interval_seconds=0.01)
+
+    elapsed_seconds = time.perf_counter() - started_at
+    release_event.set()
+    assert stopped_call.is_stopped
+    assert elapsed_seconds < 0.5
+
+
+async def test_info_panel_keeps_its_height_while_flipping_through_photos(geo_root: Path) -> None:
+    store = RatingStore(geo_root / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(geo_root), store=store)
+    app = ImageRaterApp(session=session, database_path=store.database_path)
+    info_heights: set[int] = set()
+    places_seen: set[bool] = set()
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_locations(pilot, session)
+        for _ in range(session.visible_count):
+            await pilot.pause(0.1)  # photo details are read in the background
+            info_heights.add(app.query_one("#info").outer_size.height)
+            current_location = session.get_location(session.current_file)
+            places_seen.add(current_location is not None and current_location.place is not None)
+            await pilot.press("right")
+    store.close()
+
+    assert places_seen == {True, False}  # photos with and without GPS
+    assert len(info_heights) == 1
