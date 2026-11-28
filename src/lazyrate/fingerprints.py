@@ -6,13 +6,12 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
-from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
-from pillow_heif import register_heif_opener
+from PIL import ExifTags, Image
+
+from lazyrate.photo_files import PHOTO_READ_ERRORS, open_photo, orient_photo, read_photo_exif
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-register_heif_opener()
 
 HASH_WIDTH = 8
 HASH_HEIGHT = 8
@@ -45,12 +44,12 @@ class ImageSignature:
 def compute_image_signature(path: Path) -> ImageSignature:
     """64-bit dHash: grayscale 9x8 thumbnail, one bit per "left pixel brighter than right pixel"."""
     try:
-        with Image.open(path) as source_image:
-            capture_timestamp = read_capture_timestamp(source_image)
+        capture_timestamp = read_capture_timestamp(read_photo_exif(path))
+        with open_photo(path) as source_image:
             source_image.draft("L", (DRAFT_EDGE_PX, DRAFT_EDGE_PX))
-            oriented_image = ImageOps.exif_transpose(source_image)
+            oriented_image = orient_photo(source_image)
             small_image = oriented_image.convert("L").resize((HASH_WIDTH + 1, HASH_HEIGHT), Image.Resampling.LANCZOS)
-    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError):
+    except PHOTO_READ_ERRORS:
         return ImageSignature(difference_hash=None, capture_timestamp=None)
     pixels = small_image.tobytes()  # mode "L": one byte per pixel, row-major
     difference_hash = 0
@@ -62,8 +61,7 @@ def compute_image_signature(path: Path) -> ImageSignature:
     return ImageSignature(difference_hash=difference_hash, capture_timestamp=capture_timestamp)
 
 
-def read_capture_timestamp(image: Image.Image) -> float | None:
-    exif = image.getexif()
+def read_capture_timestamp(exif: Image.Exif) -> float | None:
     captured_at_text = exif.get_ifd(ExifTags.IFD.Exif).get(ExifTags.Base.DateTimeOriginal) or exif.get(
         ExifTags.Base.DateTime
     )

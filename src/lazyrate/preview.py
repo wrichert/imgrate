@@ -5,18 +5,16 @@ from __future__ import annotations
 import asyncio
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, ClassVar
 
-from PIL import ExifTags, Image, ImageOps, UnidentifiedImageError
-from pillow_heif import register_heif_opener
+from PIL import ExifTags, Image
 
-from lazyrate.media import IMAGE_EXTENSIONS
+from lazyrate.media import PHOTO_EXTENSIONS
+from lazyrate.photo_files import PHOTO_READ_ERRORS, open_photo, orient_photo, read_photo_exif
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-register_heif_opener()
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,37 +50,114 @@ CAMERA_MAKER_SUFFIXES = ("corporation", "corp.", "corp", "co.,ltd.", "co., ltd."
 
 def load_preview(path: Path, *, max_edge_px: int) -> Preview:
     """Decode ``path`` downscaled to at most ``max_edge_px`` on its longest edge."""
-    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+    if path.suffix.lower() not in PHOTO_EXTENSIONS:
         return Preview(image=None, error="no preview for this format — press o to open externally")
     try:
-        with Image.open(path) as source_image:
+        with open_photo(path) as source_image:
             # JPEG: let libjpeg decode at 1/2, 1/4 or 1/8 scale — by far the biggest speedup.
             source_image.draft("RGB", (max_edge_px, max_edge_px))
-            oriented_image = ImageOps.exif_transpose(source_image)
+            oriented_image = orient_photo(source_image)
             oriented_image.thumbnail((max_edge_px, max_edge_px), Image.Resampling.BILINEAR)
             preview_image = oriented_image.convert("RGB")
-    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError) as error:
+    except PHOTO_READ_ERRORS as error:
         return Preview(image=None, error=f"cannot decode: {error}")
     return Preview(image=preview_image, error=None)
 
 
-def read_photo_details(path: Path) -> PhotoDetails | None:
-    """Size, capture date, camera and lens; ``None`` for videos and unreadable files. About a millisecond."""
-    if path.suffix.lower() not in IMAGE_EXTENSIONS:
+def load_full_resolution(path: Path) -> Image.Image | None:
+    """The whole photo at full size, upright (for checking focus at 100%); ``None`` if it cannot be decoded."""
+    if path.suffix.lower() not in PHOTO_EXTENSIONS:
         return None
     try:
-        with Image.open(path) as image:
-            exif = image.getexif()
-            camera_details = read_camera_details(exif)
-            return PhotoDetails(
-                width_px=image.width,
-                height_px=image.height,
-                captured_at=read_capture_date(exif),
-                camera=camera_details.camera,
-                lens=camera_details.lens,
-            )
-    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError):
+        with open_photo(path) as source_image:
+            return orient_photo(source_image).convert("RGB")
+    except PHOTO_READ_ERRORS:
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class CropBox:
+    left_px: int
+    top_px: int
+    right_px: int
+    bottom_px: int
+
+    @property
+    def width_px(self) -> int:
+        return self.right_px - self.left_px
+
+    @property
+    def height_px(self) -> int:
+        return self.bottom_px - self.top_px
+
+    def as_pillow_box(self) -> tuple[int, int, int, int]:
+        return (self.left_px, self.top_px, self.right_px, self.bottom_px)
+
+
+@dataclass(frozen=True, slots=True)
+class ZoomView:
+    """100% view: which part of the photo is shown, as the center in shares of its width and height.
+
+    Kept when moving to the next photo, so the same spot of a burst can be compared shot by shot.
+    """
+
+    PAN_STEP_RATIO: ClassVar[float] = 0.25
+    """One pan step moves by this share of the visible area."""
+
+    center_x_ratio: float = 0.5
+    center_y_ratio: float = 0.5
+
+    def pan(self, *, x_steps: int, y_steps: int, visible_width_ratio: float, visible_height_ratio: float) -> ZoomView:
+        """Move by whole steps; ``visible_*_ratio`` is the share of the photo on screen (keeps the crop inside)."""
+        return replace(
+            self,
+            center_x_ratio=clamp_center(
+                self.center_x_ratio + x_steps * self.PAN_STEP_RATIO * visible_width_ratio,
+                visible_ratio=visible_width_ratio,
+            ),
+            center_y_ratio=clamp_center(
+                self.center_y_ratio + y_steps * self.PAN_STEP_RATIO * visible_height_ratio,
+                visible_ratio=visible_height_ratio,
+            ),
+        )
+
+
+def clamp_center(center_ratio: float, *, visible_ratio: float) -> float:
+    half_visible_ratio = min(visible_ratio, 1.0) / 2
+    return min(max(center_ratio, half_visible_ratio), 1.0 - half_visible_ratio)
+
+
+def compute_zoom_crop(
+    *, image_width_px: int, image_height_px: int, view_width_px: int, view_height_px: int, zoom_view: ZoomView
+) -> CropBox:
+    """The part of the photo that fills the view at one photo pixel per screen pixel, kept inside the photo."""
+    crop_width_px = min(image_width_px, view_width_px)
+    crop_height_px = min(image_height_px, view_height_px)
+    left_px = round(zoom_view.center_x_ratio * image_width_px - crop_width_px / 2)
+    top_px = round(zoom_view.center_y_ratio * image_height_px - crop_height_px / 2)
+    left_px = min(max(left_px, 0), image_width_px - crop_width_px)
+    top_px = min(max(top_px, 0), image_height_px - crop_height_px)
+    return CropBox(left_px=left_px, top_px=top_px, right_px=left_px + crop_width_px, bottom_px=top_px + crop_height_px)
+
+
+def read_photo_details(path: Path) -> PhotoDetails | None:
+    """Size, capture date, camera and lens; ``None`` for videos and unreadable files. About a millisecond."""
+    if path.suffix.lower() not in PHOTO_EXTENSIONS:
+        return None
+    try:
+        exif = read_photo_exif(path)
+        with open_photo(path) as image:
+            width_px, height_px = image.size
+    except PHOTO_READ_ERRORS:
+        return None
+    camera_details = read_camera_details(exif)
+    return PhotoDetails(
+        width_px=width_px,
+        height_px=height_px,
+        captured_at=read_capture_date(exif),
+        camera=camera_details.camera,
+        lens=camera_details.lens,
+    )
 
 
 def read_camera_details(exif: Image.Exif) -> CameraDetails:

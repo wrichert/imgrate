@@ -16,18 +16,21 @@ from importlib import resources
 from typing import TYPE_CHECKING
 
 import numpy as np
-from PIL import ExifTags, Image, UnidentifiedImageError
-from pillow_heif import register_heif_opener
+from PIL import ExifTags
 
-from lazyrate.media import IMAGE_EXTENSIONS
+from lazyrate.fingerprints import read_capture_timestamp
+from lazyrate.media import PHOTO_EXTENSIONS
+from lazyrate.photo_files import PHOTO_READ_ERRORS, read_photo_exif
+from lazyrate.preview import read_camera_details
+from lazyrate.xmp import read_file_rating
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
     from pathlib import Path
 
-    from lazyrate.media import MediaFile
+    from PIL import Image
 
-register_heif_opener()
+    from lazyrate.media import MediaFile
 
 EARTH_RADIUS_KM = 6371.0088
 PLACE_PATH_SEPARATOR = " › "  # noqa: RUF001
@@ -69,7 +72,8 @@ class Place:
 
 @dataclass(frozen=True, slots=True)
 class PhotoLocation:
-    """GPS position of one file, valid as long as size and modification time are unchanged.
+    """Where (GPS), when and with what one photo was taken, plus the rating stored in the file (XMP); read once per
+    file and valid as long as size and modification time are unchanged.
 
     ``coordinates`` and ``place`` are ``None`` for photos without GPS data, so they are not read again.
     """
@@ -79,6 +83,23 @@ class PhotoLocation:
     modified_timestamp_utc: float
     coordinates: GeoCoordinates | None
     place: Place | None
+    camera: str | None = None
+    lens: str | None = None
+    captured_timestamp_utc: float | None = None
+    """EXIF date taken (camera clock, stored as if UTC)."""
+    file_rating: int | None = None
+    """Rating found in the photo's XMP (sidecar or embedded), e.g. set in the camera or in Lightroom."""
+
+
+@dataclass(frozen=True, slots=True)
+class PhotoFacts:
+    """Everything the metadata pass reads from one file."""
+
+    coordinates: GeoCoordinates | None
+    camera: str | None
+    lens: str | None
+    captured_timestamp_utc: float | None
+    file_rating: int | None
 
 
 def normalize_place_name(name: str) -> str:
@@ -88,13 +109,35 @@ def normalize_place_name(name: str) -> str:
     return " ".join(without_accents.casefold().replace("-", " ").split())
 
 
+def read_photo_facts(path: Path) -> PhotoFacts:
+    """GPS, camera, lens, date taken and stored rating of one photo (all ``None`` if it cannot be read)."""
+    file_rating = read_file_rating(path)
+    try:
+        exif = read_photo_exif(path)
+    except PHOTO_READ_ERRORS:
+        return PhotoFacts(
+            coordinates=None, camera=None, lens=None, captured_timestamp_utc=None, file_rating=file_rating
+        )
+    camera_details = read_camera_details(exif)
+    return PhotoFacts(
+        coordinates=read_exif_coordinates(exif),
+        camera=camera_details.camera,
+        lens=camera_details.lens,
+        captured_timestamp_utc=read_capture_timestamp(exif),
+        file_rating=file_rating,
+    )
+
+
 def read_gps_coordinates(path: Path) -> GeoCoordinates | None:
     """EXIF GPS position, or ``None`` if the file has none (or a 0/0 placeholder) or cannot be read."""
     try:
-        with Image.open(path) as image:
-            gps_tags = image.getexif().get_ifd(ExifTags.IFD.GPSInfo)
-    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError):
+        return read_exif_coordinates(read_photo_exif(path))
+    except PHOTO_READ_ERRORS:
         return None
+
+
+def read_exif_coordinates(exif: Image.Exif) -> GeoCoordinates | None:
+    gps_tags = exif.get_ifd(ExifTags.IFD.GPSInfo)
     try:
         latitude_deg = convert_to_degrees(
             gps_tags[ExifTags.GPS.GPSLatitude], reference=gps_tags.get(ExifTags.GPS.GPSLatitudeRef, "N")
@@ -233,7 +276,7 @@ def find_files_missing_locations(*, files: Iterable[MediaFile], locations: dict[
     """Image files whose GPS data was never read or changed since."""
     pending_files: list[MediaFile] = []
     for media_file in files:
-        if media_file.extension not in IMAGE_EXTENSIONS:
+        if media_file.extension not in PHOTO_EXTENSIONS:
             continue
         location = locations.get(media_file.relative_path)
         if (
@@ -272,21 +315,23 @@ class LocationReader:
                     return
                 batch_files = files[batch_start : batch_start + self.BATCH_SIZE]
                 batch_paths = [self._root / media_file.relative_path for media_file in batch_files]
-                coordinates = list(executor.map(read_gps_coordinates, batch_paths))
-                on_batch(self._build_locations(batch_files, coordinates), batch_start + len(batch_files))
+                facts = list(executor.map(read_photo_facts, batch_paths))
+                on_batch(self._build_locations(batch_files, facts), batch_start + len(batch_files))
 
-    def _build_locations(
-        self, batch_files: Sequence[MediaFile], coordinates: Sequence[GeoCoordinates | None]
-    ) -> list[PhotoLocation]:
-        known_coordinates = [point for point in coordinates if point is not None]
+    def _build_locations(self, batch_files: Sequence[MediaFile], facts: Sequence[PhotoFacts]) -> list[PhotoLocation]:
+        known_coordinates = [photo_facts.coordinates for photo_facts in facts if photo_facts.coordinates is not None]
         nearest_places = iter(self._place_index.find_nearest_places(known_coordinates))
         return [
             PhotoLocation(
                 relative_path=media_file.relative_path,
                 size_bytes=media_file.size_bytes,
                 modified_timestamp_utc=media_file.modified_timestamp_utc,
-                coordinates=point,
-                place=None if point is None else next(nearest_places),
+                coordinates=photo_facts.coordinates,
+                place=None if photo_facts.coordinates is None else next(nearest_places),
+                camera=photo_facts.camera,
+                lens=photo_facts.lens,
+                captured_timestamp_utc=photo_facts.captured_timestamp_utc,
+                file_rating=photo_facts.file_rating,
             )
-            for media_file, point in zip(batch_files, coordinates, strict=True)
+            for media_file, photo_facts in zip(batch_files, facts, strict=True)
         ]

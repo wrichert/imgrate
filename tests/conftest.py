@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import struct
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -185,3 +187,105 @@ def save_photo_with_camera(path: Path, *, maker: str, model: str, lens: str | No
     if lens is not None:
         exif.get_ifd(ExifTags.IFD.Exif)[ExifTags.Base.LensModel] = lens
     Image.new("RGB", (64, 48), (90, 120, 150)).save(path, exif=exif)
+
+
+TIFF_ASCII = 2
+TIFF_SHORT = 3
+TIFF_LONG = 4
+TIFF_RATIONAL = 5
+
+
+class TiffBuilder:
+    """Minimal little-endian TIFF writer for fake RAW files: directories, strings, rationals and embedded blobs."""
+
+    def __init__(self) -> None:
+        self.data = bytearray(b"II*\x00\x00\x00\x00\x00")
+
+    def add_blob(self, blob: bytes) -> int:
+        if len(self.data) % 2:
+            self.data.append(0)
+        offset = len(self.data)
+        self.data.extend(blob)
+        return offset
+
+    def add_directory(self, entries: list[tuple[int, int, int, bytes]]) -> int:
+        """``entries``: (tag, type, count, value bytes); returns the directory offset."""
+        packed_entries = []
+        for tag, value_type, count, value_bytes in sorted(entries):
+            if len(value_bytes) <= 4:
+                value_field = value_bytes.ljust(4, b"\x00")
+            else:
+                value_field = struct.pack("<I", self.add_blob(value_bytes))
+            packed_entries.append(struct.pack("<HHI", tag, value_type, count) + value_field)
+        directory = struct.pack("<H", len(packed_entries)) + b"".join(packed_entries) + struct.pack("<I", 0)
+        return self.add_blob(directory)
+
+    def finish(self, first_directory_offset: int) -> bytes:
+        self.data[4:8] = struct.pack("<I", first_directory_offset)
+        return bytes(self.data)
+
+
+def ascii_entry(tag: int, text: str) -> tuple[int, int, int, bytes]:
+    encoded = text.encode() + b"\x00"
+    return (tag, TIFF_ASCII, len(encoded), encoded)
+
+
+def long_entry(tag: int, value: int) -> tuple[int, int, int, bytes]:
+    return (tag, TIFF_LONG, 1, struct.pack("<I", value))
+
+
+def degrees_entry(tag: int, degrees: float) -> tuple[int, int, int, bytes]:
+    dms = convert_to_degrees_minutes_seconds(abs(degrees))
+    values = b"".join(struct.pack("<II", round(part * 1000), 1000) for part in dms)
+    return (tag, TIFF_RATIONAL, 3, values)
+
+
+def encode_jpeg(size: tuple[int, int], color: tuple[int, int, int]) -> bytes:
+    buffer = io.BytesIO()
+    Image.new("RGB", size, color).save(buffer, format="JPEG")
+    return buffer.getvalue()
+
+
+def save_fake_raw(
+    path: Path,
+    *,
+    preview_size: tuple[int, int] = (600, 400),
+    color: tuple[int, int, int] = (40, 120, 200),
+    orientation: int = 1,
+    latitude_deg: float | None = None,
+    longitude_deg: float | None = None,
+) -> None:
+    """A NEF-like file: IFD0 with camera and a small thumbnail, a sub-IFD with the large JPEG preview, EXIF and GPS
+    directories."""
+    builder = TiffBuilder()
+    thumbnail_jpeg = encode_jpeg((160, 120), (0, 0, 0))
+    preview_jpeg = encode_jpeg(preview_size, color)
+    thumbnail_offset = builder.add_blob(thumbnail_jpeg)
+    preview_offset = builder.add_blob(preview_jpeg)
+    preview_directory = builder.add_directory(
+        [long_entry(254, 0), long_entry(513, preview_offset), long_entry(514, len(preview_jpeg))]
+    )
+    exif_directory = builder.add_directory(
+        [ascii_entry(36867, "2024:08:15 10:30:00"), ascii_entry(42036, "NIKKOR Z 24-70mm f/4 S")]
+    )
+    ifd0_entries = [
+        ascii_entry(271, "NIKON CORPORATION"),
+        ascii_entry(272, "NIKON Z 6_2"),
+        (274, TIFF_SHORT, 1, struct.pack("<H", orientation)),
+        (330, TIFF_LONG, 1, struct.pack("<I", preview_directory)),
+        long_entry(513, thumbnail_offset),
+        long_entry(514, len(thumbnail_jpeg)),
+        long_entry(34665, exif_directory),
+    ]
+    if latitude_deg is not None and longitude_deg is not None:
+        gps_directory = builder.add_directory(
+            [
+                ascii_entry(1, "N" if latitude_deg >= 0 else "S"),
+                degrees_entry(2, latitude_deg),
+                ascii_entry(3, "E" if longitude_deg >= 0 else "W"),
+                degrees_entry(4, longitude_deg),
+            ]
+        )
+        ifd0_entries.append(long_entry(34853, gps_directory))
+    ifd0 = builder.add_directory(ifd0_entries)
+    path.write_bytes(builder.finish(ifd0))

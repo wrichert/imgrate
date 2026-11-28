@@ -9,12 +9,14 @@ from typing import TYPE_CHECKING, ClassVar
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Checkbox, Input, Label, SelectionList, Static
+from textual.widgets import Button, Checkbox, Input, Label, OptionList, SelectionList, Static
+from textual.widgets.option_list import Option
 from textual.widgets.selection_list import Selection
 
 from lazyrate.export import ExportOptions, validate_destination
-from lazyrate.media import IMAGE_EXTENSIONS, RAW_EXTENSIONS, VIDEO_EXTENSIONS
+from lazyrate.media import IMAGE_EXTENSIONS, PHOTO_EXTENSIONS, RAW_EXTENSIONS, VIDEO_EXTENSIONS
 from lazyrate.ratings import ALL_BUCKETS, RatingBucket, RatingFilter, build_custom_filter, describe_bucket
+from lazyrate.xmp import RatingFileMode
 
 if TYPE_CHECKING:
     from textual.app import ComposeResult
@@ -81,7 +83,7 @@ class ExtensionsScreen(ModalScreen[set[str] | None]):
         selection_list = self.query_one(SelectionList)
         selection_list.deselect_all()
         for extension in self._extension_counts:
-            if extension in IMAGE_EXTENSIONS:
+            if extension in PHOTO_EXTENSIONS:
                 selection_list.select(extension)
 
     def action_select_all(self) -> None:
@@ -89,6 +91,48 @@ class ExtensionsScreen(ModalScreen[set[str] | None]):
 
     def action_select_none(self) -> None:
         self.query_one(SelectionList).deselect_all()
+
+
+class RatingFilesScreen(ModalScreen[RatingFileMode | None]):
+    """Where ratings are stored besides lazyrate's database: XMP sidecars or inside the JPEGs."""
+
+    BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel")]
+    EXPLANATION = (
+        "Lightroom, darktable, digiKam, Capture One and Bridge read XMP ratings (rejected = -1).\n"
+        "Sidecars: DSC_1234.xmp next to the photo; an existing one only gets its rating changed.\n"
+        "Inside JPEGs: travels with the file when it is renamed or moved; only the XMP block is rewritten,\n"
+        "the picture stays byte for byte, the file date is kept. RAW and HEIC files always get sidecars.\n"
+        "Switching on writes every existing rating once. Ratings found in files are imported for\n"
+        "photos without a lazyrate rating."
+    )
+
+    def __init__(self, *, current_mode: RatingFileMode) -> None:
+        super().__init__()
+        self._current_mode = current_mode
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="dialog rating-files"):
+            yield Label("Store ratings  [dim](enter chooses · esc cancels)[/]")
+            yield OptionList(
+                *(
+                    Option(
+                        f"{'●' if mode is self._current_mode else '○'} {mode.value:<9} {mode.description}",
+                        id=mode.value,
+                    )
+                    for mode in RatingFileMode
+                )
+            )
+            yield Static(self.EXPLANATION, classes="hint")
+
+    def on_mount(self) -> None:
+        option_list = self.query_one(OptionList)
+        option_list.highlighted = list(RatingFileMode).index(self._current_mode)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        self.dismiss(RatingFileMode(event.option.id))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
 class RatingFilterScreen(ModalScreen[RatingFilter | None]):
@@ -255,6 +299,7 @@ HELP_TEXT = """\
 [b]Navigation[/b]
   → l space      next          ← h          previous
   ↓ / ↑          next / previous (grid: row down / up)
+  i              100% view to check focus: arrows / hjkl pan, space next photo (same spot), i / esc back
   pgdn / pgup    jump 10 (grid: page)
   ctrl+↑ / ↓     first / last (also ctrl+k / j, home / end)
   n              next unrated
@@ -273,6 +318,7 @@ HELP_TEXT = """\
   shift+arrows   map: pan (or drag with the mouse); click a dot to select its photo, elsewhere to center there
   M              open that map in the browser (OpenStreetMap / satellite; thumbnails in the popups)
   enter          full view of the image; enter / esc returns to grid or single view
+  RAW+JPEG       a RAW with a JPEG of the same name follows the JPEG: one photo, one rating, exported together
 
 [b]Near duplicates[/b]  (fingerprints are computed in the background, once)
   d              toggle duplicates mode: groups of similar shots taken ≤ 15 min apart
@@ -284,6 +330,10 @@ HELP_TEXT = """\
                  or by coordinates: @32.75,-16.95 50km · 32.75 -16.95 +-5km (default radius 10 km)
   esc            ends the search
 
+[b]Filters[/b]  (add to any search, or use alone)
+  camera:nikon · camera:phone · camera:"z 6" · lens:24-70 · 2024 · 2024-08 · 2024-08-15 · 2023..2024
+  e.g. "madeira camera:nikon", "beach 2023", "camera:phone 2024-08" (alone: by month, oldest first)
+
 [b]AI suggestions & search[/b]  (optional "ml" install; learns from your own ratings, nothing leaves the computer)
   y              accept the suggestion for this photo (ghost label, e.g. ★★★★? 80% or rejected? 92%)
   Y              accept the suggestions of every unrated photo in this section (one undo step)
@@ -294,6 +344,7 @@ HELP_TEXT = """\
 
 [b]Other[/b]
   E              export: choose ratings, destination, flat / symlink
+  X              store ratings also as XMP (Lightroom, darktable, …): off · sidecars · inside JPEGs
   e              choose file formats (e.g. exclude .mp4)
   o              open in system viewer
   c              copy full path to clipboard
@@ -301,7 +352,9 @@ HELP_TEXT = """\
   r              rescan folder
   q              quit
 
-Ratings are saved immediately to the SQLite file shown in the sidebar.
+Ratings are saved immediately to the SQLite file shown in the sidebar; ratings stored in the files (camera,
+Lightroom: XMP) are taken over for photos without a lazyrate rating. After 10 ratings the status bar shows your
+pace and the time left for the unrated photos.
 Export from the shell:  lazyrate export ROOT DEST --rating 5   (repeatable; or --min-rating 4)
 """
 

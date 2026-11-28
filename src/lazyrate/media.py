@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from collections import Counter
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,7 +32,10 @@ RAW_EXTENSIONS: frozenset[str] = frozenset(
     {".cr2", ".cr3", ".nef", ".arw", ".dng", ".orf", ".rw2", ".raf", ".pef", ".srw"}
 )
 
-MEDIA_EXTENSIONS: frozenset[str] = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | RAW_EXTENSIONS
+PHOTO_EXTENSIONS: frozenset[str] = IMAGE_EXTENSIONS | RAW_EXTENSIONS
+"""Everything with a picture lazyrate can show (RAW files through their embedded JPEG)."""
+
+MEDIA_EXTENSIONS: frozenset[str] = PHOTO_EXTENSIONS | VIDEO_EXTENSIONS
 """Only files with these extensions are collected by the scanner."""
 
 IGNORED_DIRECTORY_NAMES: frozenset[str] = frozenset({"@eaDir", "#recycle", "$RECYCLE.BIN", "__MACOSX"})
@@ -113,3 +116,30 @@ def _build_media_file(*, root: Path, directory_path: Path, file_name: str) -> Me
         size_bytes=stat_result.st_size,
         modified_timestamp_utc=stat_result.st_mtime,
     )
+
+
+def build_companion_key(relative_path: str) -> str:
+    """Folder plus file name without extension, case-insensitive: ``a/DSC_1234.NEF`` and ``a/dsc_1234.jpg`` match."""
+    folder, _, file_name = relative_path.rpartition("/")
+    stem = file_name.rsplit(".", 1)[0]
+    return f"{folder}/{stem}".casefold()
+
+
+def find_raw_companions(files: list[MediaFile], *, enabled_extensions: set[str]) -> dict[str, list[MediaFile]]:
+    """RAW files shot together with a JPEG / HEIC of the same name (RAW+JPEG): ``{image path: [raw files]}``.
+
+    The image is shown and rated, the RAW follows it (same rating, exported with it). Only when both formats are
+    enabled; a RAW without a twin is a photo of its own.
+    """
+    images_by_key: dict[str, MediaFile] = {}
+    for media_file in files:
+        if media_file.extension in IMAGE_EXTENSIONS and media_file.extension in enabled_extensions:
+            images_by_key.setdefault(build_companion_key(media_file.relative_path), media_file)
+    companions_by_image: defaultdict[str, list[MediaFile]] = defaultdict(list)
+    for media_file in files:
+        if media_file.extension not in RAW_EXTENSIONS or media_file.extension not in enabled_extensions:
+            continue
+        image_file = images_by_key.get(build_companion_key(media_file.relative_path))
+        if image_file is not None:
+            companions_by_image[image_file.relative_path].append(media_file)
+    return dict(companions_by_image)

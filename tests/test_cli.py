@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from conftest import save_fake_raw, save_geotagged_photo
 
 from lazyrate.cli import main, resolve_search_target
 from lazyrate.export import build_unique_flat_name
@@ -172,3 +173,19 @@ def test_map_of_a_search_contains_only_the_matches(geo_root: Path) -> None:
     assert exit_code == 0
     assert page.count('"path": ') == 1
     assert "lisbon/belem.jpg" in page
+
+
+def test_search_by_camera_and_date_narrows_a_place_search(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    save_fake_raw(tmp_path / "DSC_0001.NEF", latitude_deg=32.6657, longitude_deg=-16.9255)
+    save_geotagged_photo(tmp_path / "phone.jpg", latitude_deg=32.6657, longitude_deg=-16.9255, color=(1, 2, 3))
+
+    nikon_exit_code = main(["search", str(tmp_path), "funchal camera:nikon"])
+    nikon_output = capsys.readouterr().out
+    date_exit_code = main(["search", str(tmp_path), "2024-08"])
+    date_output = capsys.readouterr().out
+
+    assert nikon_exit_code == 0
+    assert "DSC_0001.NEF" in nikon_output
+    assert "phone.jpg" not in nikon_output
+    assert date_exit_code == 0
+    assert "DSC_0001.NEF" in date_output  # taken 2024-08-15 (the fake RAW's EXIF date)

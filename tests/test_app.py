@@ -6,7 +6,7 @@ import time
 from typing import TYPE_CHECKING
 
 import numpy as np
-from conftest import save_photo_with_camera
+from conftest import save_fake_raw, save_photo_with_camera
 from PIL import Image
 from textual.content import Content
 from textual.widgets import Input, Static
@@ -25,6 +25,7 @@ from lazyrate.ratings import REJECTED
 from lazyrate.screens import HELP_TEXT, ExportScreen
 from lazyrate.session import RatingSession, SortOrder
 from lazyrate.store import RatingStore
+from lazyrate.xmp import RatingFileMode, read_file_rating
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -728,3 +729,73 @@ async def test_info_panel_keeps_its_height_while_flipping_through_photos(geo_roo
 
     assert places_seen == {True, False}  # photos with and without GPS
     assert len(info_heights) == 1
+
+
+async def test_i_shows_the_photo_at_100_percent_pans_and_keeps_the_spot_on_the_next_photo(tmp_path: Path) -> None:
+    for index in range(2):
+        Image.new("RGB", (3000, 2000), (index * 100, 80, 160)).save(tmp_path / f"burst_{index}.jpg")
+    store = RatingStore(tmp_path / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(tmp_path), store=store)
+    app = ImageRaterApp(session=session, database_path=store.database_path)
+
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        await pilot.press("i")
+        for _ in range(40):
+            await pilot.pause(0.05)
+            if app.query_one("#preview").image is not None and app._full_resolution_image is not None:
+                break
+        zoomed_image = app.query_one("#preview").image
+        view_size_px = app._measure_view_px()
+        is_full_view_while_zoomed = app._is_full_view
+        await pilot.press("right")
+        panned_view = app._zoom_view
+        await pilot.press("space")
+        zoom_after_next_photo = app._zoom_view
+        index_after_next_photo = session.current_index
+        await pilot.press("escape")
+        is_grid_shown_after_escape = app._is_grid_shown
+        zoom_after_escape = app._zoom_view
+    store.close()
+
+    assert is_full_view_while_zoomed
+    assert zoomed_image.size == (min(3000, view_size_px.width), min(2000, view_size_px.height))
+    assert panned_view.center_x_ratio > 0.5
+    assert zoom_after_next_photo == panned_view
+    assert index_after_next_photo == 1
+    assert is_grid_shown_after_escape
+    assert zoom_after_escape is None
+
+
+async def test_capital_x_switches_ratings_to_sidecars(session: RatingSession) -> None:
+    app = ImageRaterApp(session=session, database_path=session.root / RatingStore.DEFAULT_FILE_NAME)
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await pilot.pause()
+        await pilot.press("4")  # rate the first photo
+        rated_path = next(iter(session.ratings))
+        await pilot.press("X", "down", "enter")
+        await pilot.pause()
+        session.wait_for_rating_files()
+        mode = session.rating_file_mode
+
+    assert mode is RatingFileMode.SIDECAR
+    assert read_file_rating(session.root / rated_path) == 4
+
+
+async def test_search_by_camera_shows_only_that_cameras_photos(tmp_path: Path) -> None:
+    save_fake_raw(tmp_path / "DSC_0001.NEF")
+    Image.new("RGB", (32, 32)).save(tmp_path / "screenshot.png")
+    store = RatingStore(tmp_path / RatingStore.DEFAULT_FILE_NAME)
+    session = RatingSession(scan_result=scan_media_files(tmp_path), store=store)
+    app = ImageRaterApp(session=session, database_path=store.database_path)
+
+    async with app.run_test(size=(160, 50)) as pilot:
+        await wait_for_locations(pilot, session)
+        await search_for(pilot, "camera:nikon")
+        first_section = session.sections[0]
+        matching_paths = [file.relative_path for file in session.visible_files[: first_section.size]]
+    store.close()
+
+    assert first_section.label == "2024-08"
+    assert matching_paths == ["DSC_0001.NEF"]

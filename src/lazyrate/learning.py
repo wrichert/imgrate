@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from lazyrate.embeddings import EmbeddingMatrix, StoredEmbedding, load_image_for_embedding
-from lazyrate.media import IMAGE_EXTENSIONS
+from lazyrate.media import PHOTO_EXTENSIONS
 from lazyrate.suggestions import RatingModel, evaluate_rating_model
 
 if TYPE_CHECKING:
@@ -47,7 +47,7 @@ def find_files_missing_embeddings(*, files: list[MediaFile], embeddings: dict[st
     return [
         media_file
         for media_file in files
-        if media_file.extension in IMAGE_EXTENSIONS
+        if media_file.extension in PHOTO_EXTENSIONS
         and (
             (embedding := embeddings.get(media_file.relative_path)) is None
             or not is_embedding_current(embedding, media_file)

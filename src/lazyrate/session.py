@@ -12,8 +12,18 @@ from typing import TYPE_CHECKING
 from lazyrate.duplicates import DuplicateFinder, DuplicateGroup, HashedFile
 from lazyrate.geo_map import MapPoint
 from lazyrate.locations import NO_LOCATION_LABEL, find_files_missing_locations, normalize_place_name
-from lazyrate.media import IMAGE_EXTENSIONS, MediaFile, ScanResult, build_path_sort_key
+from lazyrate.media import (
+    PHOTO_EXTENSIONS,
+    RAW_EXTENSIONS,
+    MediaFile,
+    ScanResult,
+    build_path_sort_key,
+    find_raw_companions,
+)
 from lazyrate.ratings import ALL_FILTER, MAX_STARS, REJECTED, RatingBucket, RatingFilter, describe_bucket
+from lazyrate.search_filters import PhotoFilterFacts
+from lazyrate.store import RatingStore
+from lazyrate.xmp import RatingFileMode, RatingFileWriter
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
@@ -21,7 +31,6 @@ if TYPE_CHECKING:
 
     from lazyrate.fingerprints import Fingerprint
     from lazyrate.locations import PhotoLocation
-    from lazyrate.store import RatingStore
     from lazyrate.suggestions import Suggestion
 
 
@@ -167,6 +176,9 @@ class RatingSession:
     """
 
     MAX_UNDO_DEPTH = 1000
+    RATING_FILE_MODE_SETTING_KEY = "rating_files"
+    RAW_FORMATS_OFFERED_SETTING_KEY = "raw_formats_offered"
+    """Set once RAW formats were switched on for a saved format selection from before RAW previews existed."""
 
     def __init__(
         self, *, scan_result: ScanResult, store: RatingStore, duplicate_finder: DuplicateFinder | None = None
@@ -175,12 +187,20 @@ class RatingSession:
         self._store = store
         self._duplicate_finder = duplicate_finder or DuplicateFinder()
         self._ratings = store.load_ratings()
-        saved_extensions = store.load_enabled_extensions()
-        self._enabled_extensions = (
-            saved_extensions if saved_extensions is not None else set(scan_result.extension_counts) & IMAGE_EXTENSIONS
-        )
+        self._rating_file_writer: RatingFileWriter | None = None
+        self._writer_thread_store: RatingStore | None = None
+        """Connection used by the rating file writer's thread (SQLite connections stay on their thread)."""
+        self._on_rating_file_error: Callable[[str], None] = lambda _message: None
+        self._enabled_extensions = self._load_enabled_extensions()
+        self._raw_companions: dict[str, list[MediaFile]] = {}
+        self._companion_paths: set[str] = set()
+        self._refresh_raw_companions()
         self._fingerprints = self._select_current_fingerprints(store.load_fingerprints())
         self._locations = self._select_current_locations(store.load_locations())
+        self._import_file_ratings(self._locations.values())
+        saved_mode = store.load_setting(self.RATING_FILE_MODE_SETTING_KEY)
+        if saved_mode is not None and saved_mode != RatingFileMode.OFF.value:
+            self._start_rating_file_writer(RatingFileMode(saved_mode))
         self._duplicate_groups: list[DuplicateGroup] = []
         self._is_duplicates_mode = False
         self._rating_filter = ALL_FILTER
@@ -222,6 +242,15 @@ class RatingSession:
     def all_files(self) -> list[MediaFile]:
         """Every scanned file, regardless of formats, filter and sort."""
         return self._scan_result.files
+
+    @property
+    def indexable_files(self) -> list[MediaFile]:
+        """Every scanned file except RAW files that follow a JPEG twin (fingerprints, GPS and AI use the twin)."""
+        return [
+            media_file
+            for media_file in self._scan_result.files
+            if media_file.relative_path not in self._companion_paths
+        ]
 
     @property
     def extension_counts(self) -> dict[str, int]:
@@ -346,6 +375,10 @@ class RatingSession:
     def get_rating(self, media_file: MediaFile) -> int | None:
         return self._ratings.get(media_file.relative_path)
 
+    def get_raw_companions(self, media_file: MediaFile) -> list[MediaFile]:
+        """RAW files that follow this JPEG / HEIC (RAW+JPEG shooting)."""
+        return self._raw_companions.get(media_file.relative_path, [])
+
     def get_suggestion(self, media_file: MediaFile) -> Suggestion | None:
         """Latest suggestion (also for rated files); the UI shows it for unrated ones."""
         return self._suggestions.get(media_file.relative_path)
@@ -370,17 +403,19 @@ class RatingSession:
             Counter(
                 self._ratings.get(media_file.relative_path)
                 for media_file in self._scan_result.files
-                if media_file.extension in self._enabled_extensions
+                if self._is_eligible(media_file)
             )
         )
 
     def find_relative_paths_with_ratings(self, buckets: frozenset[RatingBucket]) -> list[str]:
-        """Files of the enabled formats whose rating is in ``buckets`` (ignores the current view)."""
-        return [
-            media_file.relative_path
-            for media_file in self._scan_result.files
-            if self._is_eligible(media_file) and self.get_rating(media_file) in buckets
-        ]
+        """Files of the enabled formats whose rating is in ``buckets`` (ignores the current view), each followed by
+        its RAW companions."""
+        relative_paths: list[str] = []
+        for media_file in self._scan_result.files:
+            if self._is_eligible(media_file) and self.get_rating(media_file) in buckets:
+                relative_paths.append(media_file.relative_path)
+                relative_paths.extend(companion.relative_path for companion in self.get_raw_companions(media_file))
+        return relative_paths
 
     def load_setting(self, key: str) -> str | None:
         return self._store.load_setting(key)
@@ -410,21 +445,70 @@ class RatingSession:
             )
         return map_points
 
+    def collect_filter_facts(self) -> list[PhotoFilterFacts]:
+        """Camera, lens and date of every photo of the enabled formats, for ``camera:`` / date filters."""
+        facts: list[PhotoFilterFacts] = []
+        for media_file in self._scan_result.files:
+            if not self._is_eligible(media_file):
+                continue
+            location = self._locations.get(media_file.relative_path)
+            captured_timestamp_utc = None if location is None else location.captured_timestamp_utc
+            facts.append(
+                PhotoFilterFacts(
+                    relative_path=media_file.relative_path,
+                    camera=None if location is None else location.camera,
+                    lens=None if location is None else location.lens,
+                    captured_timestamp_utc=captured_timestamp_utc or self._compute_sort_timestamp(media_file),
+                )
+            )
+        return facts
+
     def find_files_missing_locations(self) -> list[MediaFile]:
         """Image files whose GPS data was not read yet (or changed since)."""
-        return find_files_missing_locations(files=self._scan_result.files, locations=self._locations)
+        return find_files_missing_locations(files=self.indexable_files, locations=self._locations)
 
-    def add_locations(self, locations: Iterable[PhotoLocation]) -> None:
-        """Register freshly read GPS data; the place sort follows on the next rebuild, like re-ratings."""
-        for location in locations:
+    def add_locations(self, locations: Iterable[PhotoLocation]) -> int:
+        """Register freshly read metadata (the place sort follows on the next rebuild, like re-ratings). Ratings
+        found in the files are taken over for unrated photos; returns how many."""
+        new_locations = list(locations)
+        for location in new_locations:
             self._locations[location.relative_path] = location
+        return self._import_file_ratings(new_locations)
+
+    @property
+    def rating_file_mode(self) -> RatingFileMode:
+        return RatingFileMode.OFF if self._rating_file_writer is None else self._rating_file_writer.mode
+
+    def set_rating_file_mode(self, mode: RatingFileMode) -> int:
+        """Store ratings also in XMP files from now on; every existing rating is written once. Returns how many."""
+        self._store.save_setting(key=self.RATING_FILE_MODE_SETTING_KEY, value=mode.value)
+        if mode is RatingFileMode.OFF:
+            if self._rating_file_writer is not None:
+                self._rating_file_writer.set_mode(mode)
+            return 0
+        writer = self._start_rating_file_writer(mode)
+        for relative_path, rating in self._ratings.items():
+            writer.write(relative_path=relative_path, rating=rating)
+        return len(self._ratings)
+
+    def set_rating_file_error_handler(self, on_error: Callable[[str], None]) -> None:
+        """Called (on the writer thread) when a rating cannot be written to a file."""
+        self._on_rating_file_error = on_error
+
+    @property
+    def pending_rating_file_count(self) -> int:
+        return 0 if self._rating_file_writer is None else self._rating_file_writer.pending_count
+
+    def wait_for_rating_files(self) -> None:
+        if self._rating_file_writer is not None:
+            self._rating_file_writer.wait_until_written()
 
     def find_files_missing_fingerprints(self) -> list[MediaFile]:
         """Image files (any enabled state) without an up-to-date fingerprint."""
         return [
             media_file
-            for media_file in self._scan_result.files
-            if media_file.extension in IMAGE_EXTENSIONS and media_file.relative_path not in self._fingerprints
+            for media_file in self.indexable_files
+            if media_file.extension in PHOTO_EXTENSIONS and media_file.relative_path not in self._fingerprints
         ]
 
     # -------------------------------------------------------------- navigation
@@ -595,12 +679,14 @@ class RatingSession:
     def set_enabled_extensions(self, extensions: set[str]) -> None:
         self._enabled_extensions = set(extensions)
         self._store.save_enabled_extensions(self._enabled_extensions)
+        self._refresh_raw_companions()
         self._rebuild_visible_files()
 
     def replace_scan(self, scan_result: ScanResult) -> None:
         if scan_result.root != self._scan_result.root:
             raise ValueError(f"Rescan root {scan_result.root} differs from {self._scan_result.root}")
         self._scan_result = scan_result
+        self._refresh_raw_companions()
         self._fingerprints = self._select_current_fingerprints(self._fingerprints)
         self._locations = self._select_current_locations(self._locations)
         self.rebuild_duplicate_groups()
@@ -634,12 +720,88 @@ class RatingSession:
         change = RatingChange(
             relative_path=relative_path, previous_rating=self._ratings.get(relative_path), new_rating=rating
         )
+        companion_paths = [companion.relative_path for companion in self._raw_companions.get(relative_path, [])]
+        for affected_path in [relative_path, *companion_paths]:
+            self._store_rating(relative_path=affected_path, rating=rating)
+        return change
+
+    def _store_rating(self, *, relative_path: str, rating: int | None, is_from_file: bool = False) -> None:
         self._store.set_rating(relative_path=relative_path, rating=rating)
         if rating is None:
             self._ratings.pop(relative_path, None)
         else:
             self._ratings[relative_path] = rating
-        return change
+        if self._rating_file_writer is not None and not is_from_file:
+            self._rating_file_writer.write(relative_path=relative_path, rating=rating)
+
+    def _start_rating_file_writer(self, mode: RatingFileMode) -> RatingFileWriter:
+        if self._rating_file_writer is None:
+            self._rating_file_writer = RatingFileWriter(
+                root=self.root, on_resized=self._handle_rewritten_file, on_error=self._report_rating_file_error
+            )
+        self._rating_file_writer.set_mode(mode)
+        return self._rating_file_writer
+
+    def _handle_rewritten_file(self, relative_path: str, size_bytes: int) -> None:
+        """Writer thread: an embedded rating changed the photo's size; its caches stay valid."""
+        if self._writer_thread_store is None:
+            self._writer_thread_store = RatingStore(self._store.database_path)
+        self._writer_thread_store.update_file_size(relative_path=relative_path, size_bytes=size_bytes)
+
+    def _report_rating_file_error(self, message: str) -> None:
+        self._on_rating_file_error(message)
+
+    def _import_file_ratings(self, locations: Iterable[PhotoLocation]) -> int:
+        """Ratings stored in the files (camera, Lightroom, an earlier lazyrate) for photos lazyrate has not rated;
+        lazyrate's own rating always wins. A RAW's rating also goes to its unrated JPEG twin."""
+        image_by_companion = {
+            companion.relative_path: image_path
+            for image_path, companions in self._raw_companions.items()
+            for companion in companions
+        }
+        imported_count = 0
+        for location in locations:
+            if location.file_rating is None or location.relative_path in self._ratings:
+                continue
+            self._store_rating(relative_path=location.relative_path, rating=location.file_rating, is_from_file=True)
+            imported_count += 1
+            image_path = image_by_companion.get(location.relative_path)
+            if image_path is not None and image_path not in self._ratings:
+                self._store_rating(relative_path=image_path, rating=location.file_rating, is_from_file=True)
+        if imported_count:
+            self._section_counts_cache = None
+        return imported_count
+
+    def _load_enabled_extensions(self) -> set[str]:
+        """The saved format selection; photos (RAW included) by default. A selection saved before RAW previews
+        existed gets the RAW formats once."""
+        found_extensions = set(self._scan_result.extension_counts)
+        saved_extensions = self._store.load_enabled_extensions()
+        if saved_extensions is None:
+            return found_extensions & PHOTO_EXTENSIONS
+        if self._store.load_setting(self.RAW_FORMATS_OFFERED_SETTING_KEY) is None:
+            saved_extensions |= found_extensions & RAW_EXTENSIONS
+            self._store.save_enabled_extensions(saved_extensions)
+            self._store.save_setting(key=self.RAW_FORMATS_OFFERED_SETTING_KEY, value="1")
+        return saved_extensions
+
+    def _refresh_raw_companions(self) -> None:
+        """Pair RAW files with their JPEG twins; a twin without a rating takes over its RAW's rating."""
+        self._raw_companions = find_raw_companions(self._scan_result.files, enabled_extensions=self._enabled_extensions)
+        self._companion_paths = {
+            companion.relative_path for companions in self._raw_companions.values() for companion in companions
+        }
+        for image_path, companions in self._raw_companions.items():
+            companion_rating = next(
+                (
+                    self._ratings[companion.relative_path]
+                    for companion in companions
+                    if companion.relative_path in self._ratings
+                ),
+                None,
+            )
+            if image_path not in self._ratings and companion_rating is not None:
+                self._store_rating(relative_path=image_path, rating=companion_rating)
 
     def _push_undo(self, changes: list[RatingChange]) -> None:
         if not changes:
@@ -678,7 +840,9 @@ class RatingSession:
         return media_file.modified_timestamp_utc
 
     def _is_eligible(self, media_file: MediaFile) -> bool:
-        return media_file.extension in self._enabled_extensions
+        return (
+            media_file.extension in self._enabled_extensions and media_file.relative_path not in self._companion_paths
+        )
 
     def _rebuild_visible_files(self) -> None:
         anchor_file = self.current_file

@@ -7,7 +7,7 @@ import functools
 import sys
 import webbrowser
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,6 +32,13 @@ from lazyrate.learning import (
 from lazyrate.locations import LocationReader, PlaceIndex, find_files_missing_locations
 from lazyrate.media import scan_media_files
 from lazyrate.ratings import ALL_BUCKETS, MAX_STARS, REJECTED, describe_bucket
+from lazyrate.search_filters import (
+    PhotoFilterFacts,
+    build_filter_result,
+    parse_search_filters,
+    restrict_search_result,
+    select_matching_paths,
+)
 from lazyrate.session import describe_suggestion
 from lazyrate.store import LEGACY_DATABASE_FILE_NAME, RatingStore, find_legacy_database, migrate_legacy_database
 
@@ -189,6 +196,9 @@ def run_tui(*, root: Path, database_path: Path, is_ai_enabled: bool) -> int:
             database_path=database_path,
             embedder_factory=ClipEmbedder if is_ai_enabled and is_embedding_available() else None,
         ).run()
+        if session.pending_rating_file_count:
+            print(f"Writing {session.pending_rating_file_count:,} ratings to XMP …", file=sys.stderr)
+        session.wait_for_rating_files()
     finally:
         store.close()
     return 0
@@ -317,8 +327,55 @@ def resolve_search(
     scan_result: ScanResult,
     locations: dict[str, PhotoLocation],
 ) -> ResolvedSearch:
-    """Coordinates -> radius search; a place name -> photos taken there (ranked by the rest of the query with AI);
-    anything else -> text search (AI)."""
+    """``camera:`` / date filters narrow everything (or are the whole search); coordinates -> radius search; a place
+    name -> photos taken there (ranked by the rest of the query with AI); anything else -> text search (AI)."""
+    try:
+        filters = parse_search_filters(query)
+    except ValueError as error:
+        raise SearchError(str(error)) from error
+    if not filters.is_active:
+        return resolve_unfiltered_search(
+            query=query, root=root, store=store, scan_result=scan_result, locations=locations
+        )
+    matching_facts = select_matching_paths(filters, collect_filter_facts(scan_result=scan_result, locations=locations))
+    if not filters.remaining_text:
+        return ResolvedSearch(result=build_filter_result(filters, matching_facts), format_rank=None, default_limit=None)
+    resolved_search = resolve_unfiltered_search(
+        query=filters.remaining_text, root=root, store=store, scan_result=scan_result, locations=locations
+    )
+    restricted_result = restrict_search_result(
+        resolved_search.result,
+        filters=filters,
+        allowed_paths={photo_facts.relative_path for photo_facts in matching_facts},
+    )
+    return replace(resolved_search, result=restricted_result)
+
+
+def collect_filter_facts(*, scan_result: ScanResult, locations: dict[str, PhotoLocation]) -> list[PhotoFilterFacts]:
+    """Camera, lens and date (taken, else modified) of every photo."""
+    facts: list[PhotoFilterFacts] = []
+    for media_file in scan_result.files:
+        location = locations.get(media_file.relative_path)
+        captured_timestamp_utc = None if location is None else location.captured_timestamp_utc
+        facts.append(
+            PhotoFilterFacts(
+                relative_path=media_file.relative_path,
+                camera=None if location is None else location.camera,
+                lens=None if location is None else location.lens,
+                captured_timestamp_utc=captured_timestamp_utc or media_file.modified_timestamp_utc,
+            )
+        )
+    return facts
+
+
+def resolve_unfiltered_search(
+    *,
+    query: str,
+    root: Path,
+    store: RatingStore,
+    scan_result: ScanResult,
+    locations: dict[str, PhotoLocation],
+) -> ResolvedSearch:
     try:
         radius_query = parse_radius_query(query)
     except ValueError as error:

@@ -58,7 +58,20 @@ def migrate_legacy_database(root: Path) -> None:
 
 
 def build_photo_location(row: tuple) -> PhotoLocation:
-    relative_path, size_bytes, modified_timestamp_utc, latitude_deg, longitude_deg, town, region, country = row
+    (
+        relative_path,
+        size_bytes,
+        modified_timestamp_utc,
+        latitude_deg,
+        longitude_deg,
+        town,
+        region,
+        country,
+        camera,
+        lens,
+        captured_timestamp_utc,
+        file_rating,
+    ) = row
     has_coordinates = latitude_deg is not None and longitude_deg is not None
     return PhotoLocation(
         relative_path=relative_path,
@@ -66,6 +79,10 @@ def build_photo_location(row: tuple) -> PhotoLocation:
         modified_timestamp_utc=modified_timestamp_utc,
         coordinates=GeoCoordinates(latitude_deg=latitude_deg, longitude_deg=longitude_deg) if has_coordinates else None,
         place=Place(town=town or "", region=region or "", country=country or "") if has_coordinates else None,
+        camera=camera,
+        lens=lens,
+        captured_timestamp_utc=captured_timestamp_utc,
+        file_rating=file_rating,
     )
 
 
@@ -77,6 +94,13 @@ class RatingStore:
 
     DEFAULT_FILE_NAME = ".lazyrate.sqlite"
     _ENABLED_EXTENSIONS_KEY = "enabled_extensions"
+    _SIZE_KEYED_TABLES = ("fingerprints", "locations", "embeddings")
+    _PHOTO_METADATA_COLUMNS = (
+        ("camera", "TEXT"),
+        ("lens", "TEXT"),
+        ("captured_timestamp_utc", "REAL"),
+        ("file_rating", "INTEGER"),
+    )
     _WAL_SWITCH_ATTEMPTS = 50
     _WAL_SWITCH_RETRY_DELAY_SECONDS = 0.05
     _SCHEMA = """
@@ -108,7 +132,11 @@ class RatingStore:
             longitude_deg REAL,
             town TEXT,
             region TEXT,
-            country TEXT
+            country TEXT,
+            camera TEXT,
+            lens TEXT,
+            captured_timestamp_utc REAL,
+            file_rating INTEGER
         );
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -123,6 +151,7 @@ class RatingStore:
         self._switch_to_write_ahead_log()
         self._connection.execute("PRAGMA synchronous=NORMAL")
         self._connection.executescript(self._SCHEMA)
+        self._add_photo_metadata_columns()
         self._connection.commit()
 
     def __repr__(self) -> str:
@@ -238,14 +267,15 @@ class RatingStore:
         """GPS position and nearest town per file; rows without coordinates mark files that have no GPS data."""
         rows = self._connection.execute(
             "SELECT relative_path, size_bytes, modified_timestamp_utc, latitude_deg, longitude_deg, town, region, "
-            "country FROM locations"
+            "country, camera, lens, captured_timestamp_utc, file_rating FROM locations"
         ).fetchall()
         return {row[0]: build_photo_location(row) for row in rows}
 
     def save_locations(self, locations: Iterable[PhotoLocation]) -> None:
         self._connection.executemany(
             "INSERT OR REPLACE INTO locations (relative_path, size_bytes, modified_timestamp_utc, latitude_deg, "
-            "longitude_deg, town, region, country) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "longitude_deg, town, region, country, camera, lens, captured_timestamp_utc, file_rating) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     location.relative_path,
@@ -256,6 +286,10 @@ class RatingStore:
                     None if location.place is None else location.place.town,
                     None if location.place is None else location.place.region,
                     None if location.place is None else location.place.country,
+                    location.camera,
+                    location.lens,
+                    location.captured_timestamp_utc,
+                    location.file_rating,
                 )
                 for location in locations
             ],
@@ -273,8 +307,29 @@ class RatingStore:
         )
         self._connection.commit()
 
+    def update_file_size(self, *, relative_path: str, size_bytes: int) -> None:
+        """A photo was rewritten in place (rating embedded, modification time kept): keep its cached fingerprint,
+        metadata and AI description valid instead of recomputing them."""
+        for table in self._SIZE_KEYED_TABLES:
+            self._connection.execute(
+                f"UPDATE {table} SET size_bytes = ? WHERE relative_path = ?",
+                (size_bytes, relative_path),
+            )
+        self._connection.commit()
+
     def close(self) -> None:
         self._connection.close()
+
+    def _add_photo_metadata_columns(self) -> None:
+        """Databases from before camera / date / file rating were read: add the columns and forget the rows, so the
+        (fast) metadata pass reads every photo once more."""
+        column_names = {row[1] for row in self._connection.execute("PRAGMA table_info(locations)").fetchall()}
+        missing_columns = [column for column in self._PHOTO_METADATA_COLUMNS if column[0] not in column_names]
+        if not missing_columns:
+            return
+        for column_name, column_type in missing_columns:
+            self._connection.execute(f"ALTER TABLE locations ADD COLUMN {column_name} {column_type}")
+        self._connection.execute("DELETE FROM locations")
 
     def _switch_to_write_ahead_log(self) -> None:
         """WAL mode is stored in the file, so usually only a new database switches. Switching ignores the busy

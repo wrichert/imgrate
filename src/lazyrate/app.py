@@ -20,6 +20,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
+from textual.geometry import Size
 from textual.message import Message
 from textual.widgets import Footer, Label, ProgressBar, Static
 from textual.worker import get_current_worker
@@ -60,15 +61,31 @@ from lazyrate.learning import (
 )
 from lazyrate.locations import LocationReader, PlaceIndex
 from lazyrate.media import scan_media_files
-from lazyrate.preview import PreviewCache, read_photo_details
+from lazyrate.pace import RatingPace, format_duration
+from lazyrate.preview import (
+    Preview,
+    PreviewCache,
+    ZoomView,
+    compute_zoom_crop,
+    load_full_resolution,
+    read_photo_details,
+)
 from lazyrate.ratings import ALL_BUCKETS, FILTER_PRESETS, MAX_STARS, REJECTED, describe_bucket, format_stars
 from lazyrate.screens import (
     ExportRequest,
     ExportScreen,
     ExtensionsScreen,
     HelpScreen,
+    RatingFilesScreen,
     RatingFilterScreen,
     SearchScreen,
+)
+from lazyrate.search_filters import (
+    SearchFilters,
+    build_filter_result,
+    parse_search_filters,
+    restrict_search_result,
+    select_matching_paths,
 )
 from lazyrate.session import SortOrder
 from lazyrate.store import RatingStore
@@ -81,7 +98,6 @@ if TYPE_CHECKING:
     from PIL import Image
     from textual import events
     from textual.binding import BindingType
-    from textual.geometry import Size
     from textual.timer import Timer
     from textual.widget import Widget
 
@@ -91,10 +107,11 @@ if TYPE_CHECKING:
     from lazyrate.learning import LearningResult
     from lazyrate.locations import GeoCoordinates, PhotoLocation
     from lazyrate.media import MediaFile, ScanResult
-    from lazyrate.preview import PhotoDetails, Preview
+    from lazyrate.preview import PhotoDetails
     from lazyrate.ratings import RatingFilter
     from lazyrate.session import RatingSession
     from lazyrate.suggestions import Suggestion
+    from lazyrate.xmp import RatingFileMode
 
 
 BYTES_PER_KILOBYTE = 1024
@@ -250,6 +267,14 @@ def run_and_record(function: Callable[[], object], outcome: dict[str, object]) -
         outcome["value"] = function()
     except Exception as error:
         outcome["error"] = error
+
+
+@dataclass(frozen=True, slots=True)
+class AppliedSearchFilter:
+    """``camera:`` / date filters of a search and the photos they let through."""
+
+    filters: SearchFilters
+    allowed_paths: set[str]
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,11 +485,16 @@ class ImageRaterApp(App[None]):
     .dialog .buttons { height: auto; align-horizontal: right; }
     .dialog Button { margin-left: 1; }
     .help { width: 110; max-width: 96%; }
-    ExtensionsScreen, RatingFilterScreen, ExportScreen, SearchScreen, HelpScreen { align: center middle; }
+    .rating-files { width: 104; }
+    .hint { color: $text-muted; margin-top: 1; }
+    ExtensionsScreen, RatingFilterScreen, RatingFilesScreen, ExportScreen, SearchScreen, HelpScreen {
+        align: center middle;
+    }
     """
 
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("right,l,space", "move(1)", "Next", show=False),
+        Binding("right,l", "move(1)", "Next", show=False),
+        Binding("space", "move_next", "Next", show=False),
         Binding("left,h", "move(-1)", "Prev", show=False),
         Binding("down,j", "move_row(1)", "Down", show=False),
         Binding("up,k", "move_row(-1)", "Up", show=False),
@@ -504,9 +534,11 @@ class ImageRaterApp(App[None]):
         Binding("B", "keep_suggested_best", "Keep AI best", show=False),
         Binding("L", "retrain", "Retrain", show=False),
         Binding("E", "export", "Export"),
+        Binding("X", "choose_rating_files", "XMP", show=False),
         Binding("e", "choose_extensions", "Formats"),
         Binding("o", "open_external", "Open ext"),
         Binding("c", "copy_path", "Copy path"),
+        Binding("i", "toggle_zoom", "100%"),
         Binding("p", "toggle_side_pane('preview')", "Big preview"),
         Binding("m", "toggle_side_pane('map')", "Map"),
         Binding("M", "open_browser_map", "Browser map", show=False),
@@ -562,6 +594,13 @@ class ImageRaterApp(App[None]):
         self._grid_pages: list[GridPage] = []
         self._shown_grid_page: GridPage | None = None
         self._view_refresh_timer: Timer | None = None
+        self._rating_pace = RatingPace()
+        self._zoom_view: ZoomView | None = None
+        """Set while the single / full view shows the photo at 100% (``i``)."""
+        self._is_full_view_for_zoom = False
+        """``i`` in the grid opened the full view; leaving the zoom returns to the grid."""
+        self._full_resolution_path: Path | None = None
+        self._full_resolution_image: Image.Image | None = None
         self._photo_details: dict[str, PhotoDetails | None] = {}
         """Header metadata per relative path (``None``: none readable), filled on demand for the info panel."""
         self._pending_details_path: str | None = None
@@ -584,6 +623,7 @@ class ImageRaterApp(App[None]):
         yield Footer()
 
     def on_mount(self) -> None:
+        self._session.set_rating_file_error_handler(self._report_rating_file_error_from_thread)
         self._session.set_sort_order(self.DEFAULT_SORT_ORDER)
         self._session.move_to_first_unrated()
         saved_side_pane_mode = self._session.load_setting(self.SIDE_PANE_SETTING_KEY)
@@ -598,6 +638,10 @@ class ImageRaterApp(App[None]):
     def on_unmount(self) -> None:
         self._preview_cache.shutdown()
 
+    def _report_rating_file_error_from_thread(self, message: str) -> None:
+        """Rating file writer thread."""
+        self.call_from_thread(self.notify, message, severity="warning", timeout=6, markup=False)
+
     def on_resize(self) -> None:
         if self._view_refresh_timer is not None:
             self._view_refresh_timer.stop()
@@ -606,9 +650,35 @@ class ImageRaterApp(App[None]):
     # ----------------------------------------------------------------- actions
 
     def action_move(self, delta: int) -> None:
+        """Next / previous photo; while zoomed to 100%: pan left / right."""
+        if self._is_zoom_shown:
+            self._pan_zoom(x_steps=delta, y_steps=0)
+            return
         self._navigate(lambda: self._session.move_by(delta))
 
+    def action_move_next(self) -> None:
+        """Space: always the next photo (keeps the zoom, to compare the same spot across a burst)."""
+        self._navigate(lambda: self._session.move_by(1))
+
+    def action_toggle_zoom(self) -> None:
+        """``i``: the photo at 100% (one photo pixel per screen pixel) to check focus; again or esc returns."""
+        if self._zoom_view is not None:
+            self._leave_zoom()
+            return
+        if self._session.current_file is None:
+            return
+        self._zoom_view = ZoomView()
+        self._is_full_view_for_zoom = self._is_grid_shown
+        if self._is_full_view_for_zoom:
+            self._is_full_view = True
+            self._apply_view_mode()
+        self.notify("100%: arrows / hjkl pan · space next photo (same spot) · i or esc back", timeout=3)
+        self.call_after_refresh(self._refresh_all)
+
     def action_move_row(self, direction: int) -> None:
+        if self._is_zoom_shown:
+            self._pan_zoom(x_steps=0, y_steps=direction)
+            return
         if not (self._is_grid_shown and self._grid_rows):
             self._navigate(lambda: self._session.move_by(direction))
             return
@@ -707,6 +777,21 @@ class ImageRaterApp(App[None]):
             self._handle_filter_chosen,
         )
 
+    def action_choose_rating_files(self) -> None:
+        self.push_screen(
+            RatingFilesScreen(current_mode=self._session.rating_file_mode), self._handle_rating_file_mode_chosen
+        )
+
+    def _handle_rating_file_mode_chosen(self, mode: RatingFileMode | None) -> None:
+        if mode is None or mode is self._session.rating_file_mode:
+            return
+        written_count = self._session.set_rating_file_mode(mode)
+        message = f"Ratings: {mode.description}"
+        if written_count:
+            message += f" — writing {written_count:,} existing ratings in the background"
+        self.notify(message, timeout=5)
+        self._refresh_sidebar()
+
     def action_choose_extensions(self) -> None:
         self.push_screen(
             ExtensionsScreen(
@@ -796,6 +881,7 @@ class ImageRaterApp(App[None]):
         )
 
     def action_toggle_grid(self) -> None:
+        self._zoom_view = None
         self._is_grid_mode = not self._is_grid_mode
         self._is_full_view = False
         self._apply_view_mode()
@@ -809,11 +895,17 @@ class ImageRaterApp(App[None]):
     def action_toggle_full_view(self) -> None:
         """Enter: the current image alone on the screen; enter / escape returns to the grid or single view."""
         self._is_full_view = not self._is_full_view
+        if not self._is_full_view and self._is_full_view_for_zoom:
+            self._zoom_view = None
+            self._is_full_view_for_zoom = False
         self._apply_view_mode()
         self.call_after_refresh(self._refresh_all)
 
     def action_escape(self) -> None:
-        """Leave full view first, then an active search."""
+        """Leave the 100% zoom first, then full view, then an active search."""
+        if self._zoom_view is not None:
+            self._leave_zoom()
+            return
         if self._is_full_view:
             self.action_toggle_full_view()
             return
@@ -937,33 +1029,49 @@ class ImageRaterApp(App[None]):
             self._refresh_all()
             return
         try:
-            radius_query = parse_radius_query(query)
+            filters = parse_search_filters(query)
+            radius_query = parse_radius_query(filters.remaining_text)
         except ValueError as error:
             self.notify(str(error), severity="warning", markup=False)
             return
+        if filters.is_active:
+            matching_facts = select_matching_paths(filters, self._session.collect_filter_facts())
+            if not filters.remaining_text:
+                self._apply_search_result(query, build_filter_result(filters, matching_facts))
+                return
+            search_filter = AppliedSearchFilter(
+                filters=filters, allowed_paths={photo_facts.relative_path for photo_facts in matching_facts}
+            )
+        else:
+            search_filter = None
+        query_text = filters.remaining_text
         locations = self._session.locations
         if radius_query is not None:
-            self._apply_search_result(query, search_by_radius(query=radius_query, locations=locations.values()))
+            radius_result = search_by_radius(query=radius_query, locations=locations.values())
+            self._apply_search_result(query, radius_result, search_filter=search_filter)
             return
-        place_match = find_place_match(query_text=query, locations=locations)
+        place_match = find_place_match(query_text=query_text, locations=locations)
         if place_match is not None and (not place_match.remaining_text or not self._is_ai_search_ready):
             if place_match.remaining_text:
                 self.notify(f"Text search needs AI; ignoring '{place_match.remaining_text}'", timeout=4, markup=False)
-            self._apply_search_result(query, search_by_place(match=place_match, locations=locations))
+            place_result = search_by_place(match=place_match, locations=locations)
+            self._apply_search_result(query, place_result, search_filter=search_filter)
             return
         if not self._is_ai_search_ready:
-            self.notify(self._describe_unmatched_search(query), timeout=6, markup=False)
+            self.notify(self._describe_unmatched_search(query_text), timeout=6, markup=False)
             return
-        text_query = query if place_match is None else place_match.remaining_text
+        text_query = query_text if place_match is None else place_match.remaining_text
         self._start_progress("search", title=f"Searching: {query}", total=None)
         self.run_worker(
-            functools.partial(self._run_text_search, query, text_query, place_match),
+            functools.partial(self._run_text_search, query, text_query, place_match, search_filter),
             thread=True,
             exclusive=True,
             group="search",
         )
 
-    def _run_text_search(self, query: str, text_query: str, place_match: PlaceMatch | None) -> None:
+    def _run_text_search(
+        self, query: str, text_query: str, place_match: PlaceMatch | None, search_filter: AppliedSearchFilter | None
+    ) -> None:
         if self._embedder is None or self._embedding_matrix is None:
             return
         text_scores = self._embedding_matrix.rank_by_similarity(self._embedder.embed_text(text_query))
@@ -971,13 +1079,21 @@ class ImageRaterApp(App[None]):
             result = SearchResult(scores=text_scores, section_labels={}, summary="Best matches first")
         else:
             result = rank_within_place(match=place_match, text_scores=text_scores)
-        self.call_from_thread(self._handle_text_search_done, query, result)
+        self.call_from_thread(self._handle_text_search_done, query, result, search_filter)
 
-    def _handle_text_search_done(self, query: str, result: SearchResult) -> None:
+    def _handle_text_search_done(
+        self, query: str, result: SearchResult, search_filter: AppliedSearchFilter | None
+    ) -> None:
         self._finish_progress("search")
-        self._apply_search_result(query, result)
+        self._apply_search_result(query, result, search_filter=search_filter)
 
-    def _apply_search_result(self, query: str, result: SearchResult) -> None:
+    def _apply_search_result(
+        self, query: str, result: SearchResult, *, search_filter: AppliedSearchFilter | None = None
+    ) -> None:
+        if search_filter is not None:
+            result = restrict_search_result(
+                result, filters=search_filter.filters, allowed_paths=search_filter.allowed_paths
+            )
         if not result.scores:
             self.notify(f"No matches: {result.summary}", severity="warning", timeout=4, markup=False)
             return
@@ -1168,8 +1284,11 @@ class ImageRaterApp(App[None]):
         self.call_from_thread(self._handle_locations_read, locations, done_count, total_count)
 
     def _handle_locations_read(self, locations: list[PhotoLocation], done_count: int, total_count: int) -> None:
-        self._session.add_locations(locations)
+        imported_count = self._session.add_locations(locations)
         self._update_progress("locations", done_count=done_count, total_count=total_count)
+        if imported_count:
+            self.notify(f"Took over {imported_count:,} ratings stored in the files (XMP)", timeout=4)
+            self._refresh_all()
 
     def _handle_locations_done(self) -> None:
         self._finish_progress("locations")
@@ -1193,7 +1312,7 @@ class ImageRaterApp(App[None]):
         store = RatingStore(self._database_path)
         try:
             embeddings = store.load_embeddings(embedder.model_name)
-            pending_files = find_files_missing_embeddings(files=self._session.all_files, embeddings=embeddings)
+            pending_files = find_files_missing_embeddings(files=self._session.indexable_files, embeddings=embeddings)
             if pending_files:
                 self.call_from_thread(
                     self._start_progress, "embeddings", title="Reading image content (AI)", total=len(pending_files)
@@ -1368,6 +1487,10 @@ class ImageRaterApp(App[None]):
         return self._side_pane_mode is SidePaneMode.MAP and not self._is_full_view
 
     @property
+    def _is_zoom_shown(self) -> bool:
+        return self._zoom_view is not None and not self._is_grid_shown
+
+    @property
     def _is_grid_shown(self) -> bool:
         """Full view temporarily replaces the grid; ``_is_grid_mode`` remembers where to return to."""
         return self._is_grid_mode and not self._is_full_view
@@ -1397,6 +1520,8 @@ class ImageRaterApp(App[None]):
     def _apply_rating(self, rating: int | None) -> None:
         if self._session.rate_current(rating) is None:
             return
+        if rating is not None:
+            self._rating_pace.record_rating()
         self._note_rating_changes(1)
         if self._is_auto_advance and rating is not None:
             self._session.move_by(1)
@@ -1414,6 +1539,8 @@ class ImageRaterApp(App[None]):
             return
         if self._is_grid_shown:
             self._refresh_grid()
+        elif self._is_zoom_shown:
+            self._show_zoomed_preview()
         else:
             self.run_worker(self._show_current_preview(), exclusive=True, group="preview")
         if self._is_side_preview_shown:
@@ -1449,8 +1576,20 @@ class ImageRaterApp(App[None]):
             "   ",
             (f"view: {self._session.rating_filter.name}", "cyan"),
             (self._describe_order(), "cyan"),
+            (self._describe_pace(), "green"),
         )
         self.query_one("#statusbar", Static).update(status_text)
+
+    def _describe_pace(self) -> str:
+        """``   12/min · 340 unrated · ~28 min left`` once enough ratings were given in this session."""
+        ratings_per_minute = self._rating_pace.ratings_per_minute
+        if ratings_per_minute is None:
+            return ""
+        unrated_count = self._session.count_ratings().get(None, 0)
+        remaining_seconds = self._rating_pace.estimate_remaining_seconds(unrated_count) or 0.0
+        return (
+            f"   {ratings_per_minute:.0f}/min · {unrated_count:,} unrated · {format_duration(remaining_seconds)} left"
+        )
 
     def _refresh_sidebar(self) -> None:
         if self._find_grid() is None:
@@ -1473,8 +1612,12 @@ class ImageRaterApp(App[None]):
         details = self._find_photo_details(current_file)
         location = self._session.get_location(current_file)
         place = None if location is None else location.place
+        companion_extensions = sorted(
+            {companion.extension.lstrip(".").upper() for companion in self._session.get_raw_companions(current_file)}
+        )
+        companion_note = f" + {', '.join(companion_extensions)}" if companion_extensions else ""
         lines = [
-            Text(file_name, style="bold"),
+            Text.assemble((file_name, "bold"), (companion_note, "dim")),
             Text(truncate_from_left(folder or ".", max_length=line_width), style="dim"),
             Text(""),
             Text.assemble(build_rating_text(self._session.current_rating), self._build_suggestion_hint(current_file)),
@@ -1595,6 +1738,8 @@ class ImageRaterApp(App[None]):
             duplicates_text,
             ("\nFormats  ", "bold"),
             " ".join(sorted(self._session.enabled_extensions)) or "(none)",
+            ("\nXMP  ", "bold"),
+            self._session.rating_file_mode.value,
             ("\nAuto-advance  ", "bold"),
             "on" if self._is_auto_advance else "off",
             ("\nAI  ", "bold"),
@@ -1832,6 +1977,80 @@ class ImageRaterApp(App[None]):
         preview_widget.styles.width = cell_box.columns
         preview_widget.styles.height = cell_box.rows
         preview_widget.image = preview.image
+
+    def _leave_zoom(self) -> None:
+        self._zoom_view = None
+        if self._is_full_view_for_zoom:
+            self._is_full_view_for_zoom = False
+            self._is_full_view = False
+            self._apply_view_mode()
+        self.call_after_refresh(self._refresh_all)
+
+    def _measure_view_px(self) -> Size:
+        viewer_size = self.query_one("#viewer").content_size
+        cell_size = get_cell_size()
+        return Size(viewer_size.width * cell_size.width, viewer_size.height * cell_size.height)
+
+    def _pan_zoom(self, *, x_steps: int, y_steps: int) -> None:
+        image = self._full_resolution_image
+        if self._zoom_view is None or image is None:
+            return
+        view_size_px = self._measure_view_px()
+        self._zoom_view = self._zoom_view.pan(
+            x_steps=x_steps,
+            y_steps=y_steps,
+            visible_width_ratio=min(1.0, view_size_px.width / image.width),
+            visible_height_ratio=min(1.0, view_size_px.height / image.height),
+        )
+        self._show_zoomed_preview()
+
+    def _show_zoomed_preview(self) -> None:
+        current_file = self._session.current_file
+        if current_file is None or self._zoom_view is None:
+            return
+        self.run_worker(
+            functools.partial(
+                self._render_zoomed_preview,
+                self._session.resolve_path(current_file),
+                self._zoom_view,
+                self._measure_view_px(),
+            ),
+            thread=True,
+            exclusive=True,
+            group="zoom",
+        )
+
+    def _render_zoomed_preview(self, path: Path, zoom_view: ZoomView, view_size_px: Size) -> None:
+        """Worker thread: decode at full size (cached for the current photo), cut out the visible part."""
+        if path != self._full_resolution_path:
+            self._full_resolution_image = load_full_resolution(path)
+            self._full_resolution_path = path
+        image = self._full_resolution_image
+        if get_current_worker().is_cancelled:
+            return
+        if image is None:
+            self.call_from_thread(self._display_preview, Preview(image=None, error="cannot decode at full size"))
+            return
+        crop_box = compute_zoom_crop(
+            image_width_px=image.width,
+            image_height_px=image.height,
+            view_width_px=view_size_px.width,
+            view_height_px=view_size_px.height,
+            zoom_view=zoom_view,
+        )
+        self.call_from_thread(self._display_zoomed_preview, image.crop(crop_box.as_pillow_box()))
+
+    def _display_zoomed_preview(self, cropped_image: Image.Image) -> None:
+        if not self._is_zoom_shown:
+            return
+        preview_widget = self.query_one("#preview", ImageWidget)
+        viewer_size = self.query_one("#viewer").content_size
+        cell_size = get_cell_size()
+        self.query_one("#placeholder", Static).display = False
+        preview_widget.display = True
+        preview_widget.styles.width = min(viewer_size.width, math.ceil(cropped_image.width / cell_size.width))
+        preview_widget.styles.height = min(viewer_size.height, math.ceil(cropped_image.height / cell_size.height))
+        preview_widget.image = cropped_image
 
     def _prefetch_neighbours(self, *, max_edge_px: int) -> None:
         visible_files = self._session.visible_files

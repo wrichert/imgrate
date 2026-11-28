@@ -21,9 +21,9 @@ from importlib import resources
 from typing import TYPE_CHECKING, ClassVar
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageOps, UnidentifiedImageError
-from pillow_heif import register_heif_opener
+from PIL import Image, ImageDraw, ImageFont
 
+from lazyrate.photo_files import PHOTO_READ_ERRORS, open_photo, orient_photo
 from lazyrate.ratings import describe_bucket
 
 if TYPE_CHECKING:
@@ -31,8 +31,6 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from lazyrate.locations import GeoCoordinates, Place
-
-register_heif_opener()
 
 MAX_LATITUDE_DEG = 85.0
 WORLD_CENTER_LONGITUDE_DEG = 10.0
@@ -610,11 +608,11 @@ class BrowserMapPhoto:
 def create_thumbnail_data_uri(path: Path, *, edge_px: int = THUMBNAIL_EDGE_PX) -> str | None:
     """Small JPEG as a ``data:`` URI (browsers cannot show HEIC, and the page must work without a server)."""
     try:
-        with Image.open(path) as source_image:
+        with open_photo(path) as source_image:
             source_image.draft("RGB", (edge_px, edge_px))
-            thumbnail = ImageOps.exif_transpose(source_image).convert("RGB")
+            thumbnail = orient_photo(source_image).convert("RGB")
             thumbnail.thumbnail((edge_px, edge_px))
-    except (OSError, UnidentifiedImageError, ValueError, Image.DecompressionBombError):
+    except PHOTO_READ_ERRORS:
         return None
     buffer = io.BytesIO()
     thumbnail.save(buffer, format="JPEG", quality=THUMBNAIL_JPEG_QUALITY)

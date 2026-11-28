@@ -30,9 +30,12 @@ terminals with a graphics protocol (Ghostty, Kitty, WezTerm, iTerm2) they are sh
 | **Find "that beach on Madeira"** | place + AI text combined: `/` → "beach madeira" (only Madeira photos, best beach matches first) |
 | **Browse the archive by where, not when** | sort **place**: sections per country › region › town |
 | **See where the photos of a trip (or a search) were taken** | `m`: offline map in the right pane, current photo marked; `M`: zoomable map in the browser with thumbnails |
+| **Cull a camera shoot (RAW+JPEG)** | RAW files show their embedded JPEG (no RAW decoder needed), a RAW and its JPEG are one photo with one rating, `i` checks focus at 100 %, ratings go to Lightroom & co. as XMP (`X`) |
+| **"Only the Nikon shots" / "only the phone"** | search filters: `/` → `camera:nikon`, `camera:phone 2024-08`, `madeira camera:nikon`, `lens:24-70` |
 | **Keep up with new photos** | ratings stay with the folder; rescan, only new photos are unrated, the AI already knows your taste |
 
-lazyrate never deletes or modifies photos. Rejected photos are just marked; to clean up, export them
+lazyrate never deletes photos and only changes them if you ask it to write ratings into JPEGs (`X`, then only the
+XMP block; RAW files are never touched). Rejected photos are just marked; to clean up, export them
 (`lazyrate export ROOT ~/to-delete --rating 0 --symlink`) and decide there.
 
 ## How it works
@@ -68,11 +71,18 @@ flowchart TD
 - Recursively scans a folder (hidden folders and NAS metadata like `@eaDir` are skipped)
 - Real image previews in the terminal: Kitty graphics protocol (Ghostty, Kitty, WezTerm), Sixel (iTerm2, foot, …), unicode fallback elsewhere
 - Background decoding + prefetch of the next images, JPEG draft-mode decoding (24 MP → ~25 ms), EXIF orientation, HEIC/HEIF
+- RAW files (NEF, CR2, CR3, ARW, DNG, ORF, RW2, RAF, PEF, SRW) through their embedded full-size JPEG: preview, AI,
+  GPS, camera and lens like any photo; RAW+JPEG pairs count as one photo
+- 100 % view to check focus (`i`), keeps the spot when you go to the next shot of a burst
+- Ratings also as XMP for Lightroom, darktable, digiKam, Capture One (`X`: sidecars or inside JPEGs); ratings set in
+  the camera or another program are taken over for unrated photos
 - Ratings stored immediately in SQLite (`ROOT/.lazyrate.sqlite`), keyed by path relative to the root, so the folder can be moved
   (a `.imgrate.sqlite` from before the rename to lazyrate is renamed automatically, ratings are kept)
 - Info panel per photo: size, date taken, camera and lens (`NIKON Z 6_2` · `NIKKOR Z 24-70mm f/4 S`, or
   `Apple iPhone 15 Pro` · `back triple camera 6.86mm f/1.78`), place
 - Sort by path, rating (best first), date taken or place
+- Search filters by camera, lens and date (`camera:phone`, `lens:50mm`, `2024-08`), alone or with any search
+- Your pace and the time left for the unrated photos in the status bar
 - Search by place: GPS positions are read once and named offline (nearest town, region, country from
   [GeoNames](https://www.geonames.org/)); `/madeira`, `/funchal`, `/portugal` or `/@32.75,-16.95 50km`
 - Maps: an offline map of the view or the search matches in the right pane (`m`), and a browser map with
@@ -81,7 +91,7 @@ flowchart TD
   and cached in SQLite; review one group at a time and keep the best with a single key
 - Review any rating bucket (unrated, rejected, ≥ N stars, any combination) in single view or as a thumbnail grid
 - Export from the app (`E`) or the shell, by copy or symlink, flat or with sub folders
-- Choose which file formats take part (images on by default; `.mp4`, `.mov`, RAW etc. off unless you enable them)
+- Choose which file formats take part (photos incl. RAW on by default; videos off unless you enable them)
 - Optional AI: suggested ratings learned from **your own** ratings (rejected 0 and 1–5 stars), "rate where it learns
   most", text search ("beach sunset"), best-of-burst hints — all local, nothing is uploaded
 - Progress bars for everything that runs in the background
@@ -119,6 +129,8 @@ lazyrate classify ~/Pictures/2025              # AI: index, learn from your rati
 lazyrate search ~/Pictures/2025 madeira        # all photos taken in Madeira (GPS), grouped by town
 lazyrate search funchal                        # ... in the current folder (a word that is no sub folder is the query)
 lazyrate search ~/Pictures/2025 --near=32.75,-16.95 --radius 50   # within 50 km, nearest first
+lazyrate search "camera:nikon 2024-08"         # filters: camera, lens, date (alone or with any search)
+lazyrate search "madeira camera:phone"         # ... phone photos taken in Madeira
 lazyrate map ~/Pictures/2025                   # browser map of all photos with GPS data
 lazyrate map ~/Pictures/2025 madeira           # ... of a search's matches (any search form; --output, --no-open)
 lazyrate search ~/Pictures/2025 "dog in snow"  # AI: best matches for a description
@@ -135,6 +147,7 @@ lazyrate ~/Pictures/2025 --no-ai               # TUI without AI even if installe
 | `u` | clear rating |
 | `z` | undo |
 | `→` `l` `space` / `←` `h` | next / previous |
+| `i` | 100 % view to check focus: arrows / `hjkl` pan, `space` next photo (same spot), `i` / `esc` back |
 | `↓` `↑` | next / previous (grid: row) |
 | `pgdn` `pgup` | jump 10 (grid: page) |
 | `ctrl+↑` `ctrl+↓` (or `ctrl+k` `ctrl+j`, `home` `end`) | first / last |
@@ -153,6 +166,7 @@ lazyrate ~/Pictures/2025 --no-ai               # TUI without AI even if installe
 | `d` | toggle duplicates mode (each group is a section) |
 | `b` | duplicates mode: keep this one, reject the rest of the group, jump to next group |
 | `E` | export: pick ratings, destination, flat / symlink (remembered for next time) |
+| `X` | store ratings also as XMP: off · sidecars · inside JPEGs (see [RAW files and XMP](#raw-files-and-xmp)) |
 | `e` | choose file formats |
 | `o` | open in the system viewer (also for videos) |
 | `c` | copy the full path to the clipboard |
@@ -186,7 +200,7 @@ Section counts are live: a section with re-rated photos waiting for `S` is marke
 ### Places (GPS)
 
 On start lazyrate reads the GPS position of every photo once in the background (EXIF only, about 1 ms per photo;
-JPEG and HEIC) and names it offline after the nearest town, with its region and country. The town table is built
+JPEG, HEIC and RAW) and names it offline after the nearest town, with its region and country. The town table is built
 from GeoNames (every town with ≥ 1,000 inhabitants, 2.7 MB, bundled); big cities get a larger radius, so a photo in
 central Funchal says Funchal and not the parish next door. Nothing is looked up online.
 
@@ -195,6 +209,7 @@ central Funchal says Funchal and not the parish next door. Nothing is looked up 
 | `madeira`, `funchal`, `portugal`, `são vicente` / `sao vicente` | photos whose town, region or country has that name (case and accents don't matter), one section per town |
 | `@32.75,-16.95 50km`, `32.75 -16.95 +-5km`, `near:32.75,-16.95` | photos within the radius (default 10 km), nearest first, sections by distance (`< 1 km`, `1-5 km`, …) |
 | `beach madeira` (AI) | photos taken in Madeira, ranked by how well they match "beach" |
+| `camera:nikon`, `camera:phone`, `camera:"z 6"`, `lens:24-70`, `2024`, `2024-08`, `2024-08-15`, `2023..2024` | filters; alone: those photos by month, oldest first; with any other search: narrow it (`madeira camera:nikon`, `beach 2023`) |
 | anything else (AI) | text search over image content |
 
 Sort **place** (`s`) shows the whole folder by country › region › town; photos without GPS come last. The info pane
@@ -219,6 +234,31 @@ Limits: photos without GPS data can't be found this way (older cameras, and imag
 editors that strip EXIF). Names are the English GeoNames names of towns, regions (state, province, island group)
 and countries; landmarks, beaches or mountains ("Pico do Arieiro") are not in the table, but their coordinates are:
 `@32.735,-16.929 3km`.
+
+### RAW files and XMP
+
+**RAW.** Every RAW file carries a JPEG preview rendered by the camera, for Nikon, Canon, Sony and Fujifilm at or
+near full size. lazyrate shows that preview (no RAW decoder, no extra install) and reads camera, lens, date and GPS
+from the RAW itself, so RAW files get previews, AI suggestions, duplicates detection and maps like any photo.
+Shooting RAW+JPEG gives `DSC_1234.NEF` and `DSC_1234.JPG`: lazyrate shows the JPEG (with "+ NEF" in the info
+panel), a rating applies to both, export copies both. Without a JPEG twin, the RAW is a photo of its own.
+
+**Checking focus.** `i` shows the photo at 100 % (one photo pixel per screen pixel); arrows or `hjkl` pan, `space`
+goes to the next photo and keeps the spot, so the sharpest shot of a burst is easy to find. `i` or `esc` returns.
+
+**XMP.** Ratings live in `.lazyrate.sqlite`. With `X` they are also written as XMP, which Lightroom, darktable,
+digiKam, Capture One and Bridge read (`xmp:Rating`, rejected = -1):
+
+| Mode | Where | Renaming / moving files |
+| --- | --- | --- |
+| off (default) | only the database | ratings are lost for renamed files |
+| sidecars | `DSC_1234.xmp` next to the photo; an existing sidecar (e.g. with Lightroom edits) only gets its rating changed | kept if the sidecar is renamed too (Lightroom, Capture One do that) |
+| inside JPEGs | the JPEG's XMP block (lossless, picture unchanged, file date kept); RAW, HEIC and others get sidecars | kept: the rating travels with the file |
+
+Switching on writes every existing rating once; files are written in the background (lazyrate waits for the last
+ones when you quit). Filtering and sorting always use the database, so neither mode slows them down. The other way
+round, ratings found in sidecars or inside the files (set in the camera, in Lightroom, or by lazyrate on another
+computer) are taken over for photos that have no lazyrate rating yet; lazyrate's own rating wins.
 
 ### AI suggestions (optional)
 
