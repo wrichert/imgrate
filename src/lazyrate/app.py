@@ -24,7 +24,6 @@ from textual.geometry import Size
 from textual.message import Message
 from textual.widgets import Footer, Label, ProgressBar, Static
 from textual.worker import get_current_worker
-from textual_image.widget import Image as ImageWidget
 from textual_image.widget import get_cell_size
 
 from lazyrate.export import ExportOptions, ExportSummary, export_files
@@ -63,10 +62,12 @@ from lazyrate.locations import LocationReader, PlaceIndex
 from lazyrate.media import scan_media_files
 from lazyrate.pace import RatingPace, format_duration
 from lazyrate.preview import (
+    DisplayTarget,
     Preview,
     PreviewCache,
     ZoomView,
     compute_zoom_crop,
+    fit_image_to_cells,
     load_full_resolution,
     read_photo_details,
 )
@@ -90,6 +91,7 @@ from lazyrate.search_filters import (
 from lazyrate.session import SortOrder
 from lazyrate.store import RatingStore
 from lazyrate.suggestions import RatingModel
+from lazyrate.terminal_images import TERMINAL_PAYLOADS, ImageWidget, PhotoWidget
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -118,33 +120,14 @@ BYTES_PER_KILOBYTE = 1024
 CLIPBOARD_COMMANDS = (["pbcopy"], ["wl-copy"], ["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"])
 
 
-@dataclass(frozen=True, slots=True)
-class CellBox:
-    """A size in terminal cells."""
-
-    columns: int
-    rows: int
-
-
-def fit_image_to_cells(
-    *,
-    image_width_px: int,
-    image_height_px: int,
-    max_columns: int,
-    max_rows: int,
-    cell_width_px: int,
-    cell_height_px: int,
-) -> CellBox:
-    """Largest cell box with the image's aspect ratio that fits into ``max_columns`` x ``max_rows``."""
-    if image_width_px <= 0 or image_height_px <= 0:
-        raise ValueError(f"Invalid image size {image_width_px}x{image_height_px}")
-    scale_factor = min(
-        max_columns * cell_width_px / image_width_px,
-        max_rows * cell_height_px / image_height_px,
-    )
-    return CellBox(
-        columns=max(1, min(max_columns, math.floor(image_width_px * scale_factor / cell_width_px))),
-        rows=max(1, min(max_rows, math.floor(image_height_px * scale_factor / cell_height_px))),
+def build_display_target(box_size: Size) -> DisplayTarget:
+    """Where a preview filling ``box_size`` (cells) is shown, as fitted by :func:`fit_image_to_cells`."""
+    cell_size = get_cell_size()
+    return DisplayTarget(
+        max_columns=max(1, box_size.width),
+        max_rows=max(1, box_size.height),
+        cell_width_px=cell_size.width,
+        cell_height_px=cell_size.height,
     )
 
 
@@ -404,7 +387,7 @@ class ThumbnailCell(Vertical):
 
     def compose(self) -> ComposeResult:
         with Container(classes="thumbnail-image-box"):
-            yield ImageWidget(classes="thumbnail-image")
+            yield PhotoWidget(classes="thumbnail-image")
         yield Label("", classes="thumbnail-label")
 
     def find_image_widget(self) -> ImageWidget | None:
@@ -575,7 +558,7 @@ class ImageRaterApp(App[None]):
         self._rating_changes_since_training = 0
         self._progress_rows: dict[str, TaskProgressRow] = {}
         self._indexing_progress: IndexingProgress | None = None
-        self._preview_cache = PreviewCache()
+        self._preview_cache = PreviewCache(prepare_display=TERMINAL_PAYLOADS.prepare)
         self._place_index = PlaceIndex()
         self._is_auto_advance = True
         self._is_grid_mode = True
@@ -608,12 +591,12 @@ class ImageRaterApp(App[None]):
     def compose(self) -> ComposeResult:
         with Horizontal(id="main"):
             with Container(id="viewer"):
-                yield ImageWidget(id="preview")
+                yield PhotoWidget(id="preview")
                 yield Static("", id="placeholder")
             yield Container(id="grid")
             with Vertical(id="sidebar"):
                 with MapPane(id="side-preview"):
-                    yield ImageWidget(id="side-preview-image")
+                    yield PhotoWidget(id="side-preview-image")
                 yield Static(id="info")
                 yield Static(id="sections")
                 yield Static(id="counts")
@@ -1802,12 +1785,17 @@ class ImageRaterApp(App[None]):
             placeholder.update("No files in this view — press v / f to change the view, e for formats")
             return
 
-        max_edge_px = self._compute_preview_edge_px(self.query_one("#viewer").content_size)
-        preview_future = self._preview_cache.request(self._session.resolve_path(current_file), max_edge_px=max_edge_px)
-        self._prefetch_neighbours(max_edge_px=max_edge_px)
+        viewer_size = self.query_one("#viewer").content_size
+        max_edge_px = self._compute_preview_edge_px(viewer_size)
+        display_target = build_display_target(viewer_size)
+        current_path = self._session.resolve_path(current_file)
+        preview_future = self._preview_cache.request(
+            current_path, max_edge_px=max_edge_px, display_target=display_target
+        )
+        self._prefetch_neighbours(max_edge_px=max_edge_px, display_target=display_target)
         if not preview_future.done():
             placeholder.update("loading…")
-        preview = await self._preview_cache.get(self._session.resolve_path(current_file), max_edge_px=max_edge_px)
+        preview = await self._preview_cache.get(current_path, max_edge_px=max_edge_px, display_target=display_target)
         if self._session.current_file != current_file:
             return
         self._display_preview(preview)
@@ -1820,8 +1808,11 @@ class ImageRaterApp(App[None]):
             image_widget.image = None
             return
         max_edge_px = self._compute_preview_edge_px(box_size)
-        self._prefetch_neighbours(max_edge_px=max_edge_px)
-        preview = await self._preview_cache.get(self._session.resolve_path(current_file), max_edge_px=max_edge_px)
+        display_target = build_display_target(box_size)
+        self._prefetch_neighbours(max_edge_px=max_edge_px, display_target=display_target)
+        preview = await self._preview_cache.get(
+            self._session.resolve_path(current_file), max_edge_px=max_edge_px, display_target=display_target
+        )
         if self._session.current_file != current_file or not image_widget.is_attached:
             return
         if not self._is_side_preview_shown:  # switched to the map while decoding
@@ -2061,7 +2052,7 @@ class ImageRaterApp(App[None]):
         preview_widget.styles.height = min(viewer_size.height, math.ceil(cropped_image.height / cell_size.height))
         preview_widget.image = cropped_image
 
-    def _prefetch_neighbours(self, *, max_edge_px: int) -> None:
+    def _prefetch_neighbours(self, *, max_edge_px: int, display_target: DisplayTarget) -> None:
         visible_files = self._session.visible_files
         current_index = self._session.current_index
         neighbour_indices = [current_index + offset for offset in range(1, self.PREFETCH_AHEAD_COUNT + 1)]
@@ -2069,7 +2060,9 @@ class ImageRaterApp(App[None]):
         for neighbour_index in neighbour_indices:
             if 0 <= neighbour_index < len(visible_files):
                 self._preview_cache.request(
-                    self._session.resolve_path(visible_files[neighbour_index]), max_edge_px=max_edge_px
+                    self._session.resolve_path(visible_files[neighbour_index]),
+                    max_edge_px=max_edge_px,
+                    display_target=display_target,
                 )
 
     # -------------------------------------------------------------------- grid
@@ -2195,7 +2188,9 @@ class ImageRaterApp(App[None]):
         self, *, cell: ThumbnailCell, media_file: MediaFile, max_columns: int, max_rows: int
     ) -> None:
         preview = await self._preview_cache.get(
-            self._session.resolve_path(media_file), max_edge_px=self.THUMBNAIL_EDGE_PX
+            self._session.resolve_path(media_file),
+            max_edge_px=self.THUMBNAIL_EDGE_PX,
+            display_target=build_display_target(Size(max_columns, max_rows)),
         )
         thumbnail_widget = cell.find_image_widget()
         label = cell.find_label()

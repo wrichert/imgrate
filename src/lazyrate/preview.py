@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
@@ -14,6 +15,7 @@ from lazyrate.media import PHOTO_EXTENSIONS
 from lazyrate.photo_files import PHOTO_READ_ERRORS, open_photo, orient_photo, read_photo_exif
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 
@@ -23,6 +25,56 @@ class Preview:
 
     image: Image.Image | None
     error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class CellBox:
+    """A size in terminal cells."""
+
+    columns: int
+    rows: int
+
+
+def fit_image_to_cells(
+    *,
+    image_width_px: int,
+    image_height_px: int,
+    max_columns: int,
+    max_rows: int,
+    cell_width_px: int,
+    cell_height_px: int,
+) -> CellBox:
+    """Largest cell box with the image's aspect ratio that fits into ``max_columns`` x ``max_rows``."""
+    if image_width_px <= 0 or image_height_px <= 0:
+        raise ValueError(f"Invalid image size {image_width_px}x{image_height_px}")
+    scale_factor = min(
+        max_columns * cell_width_px / image_width_px,
+        max_rows * cell_height_px / image_height_px,
+    )
+    return CellBox(
+        columns=max(1, min(max_columns, math.floor(image_width_px * scale_factor / cell_width_px))),
+        rows=max(1, min(max_rows, math.floor(image_height_px * scale_factor / cell_height_px))),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class DisplayTarget:
+    """Where a preview will be shown: the largest box available (cells) and the terminal's cell size."""
+
+    max_columns: int
+    max_rows: int
+    cell_width_px: int
+    cell_height_px: int
+
+    def fit(self, image: Image.Image) -> CellBox:
+        return fit_image_to_cells(
+            image_width_px=image.width,
+            image_height_px=image.height,
+            max_columns=self.max_columns,
+            max_rows=self.max_rows,
+            cell_width_px=self.cell_width_px,
+            cell_height_px=self.cell_height_px,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +255,11 @@ def read_capture_date(exif: Image.Exif) -> str | None:
 
 
 class PreviewCache:
-    """LRU cache of preview futures, decoded on a thread pool so prefetching never blocks the UI."""
+    """LRU cache of preview futures, decoded on a thread pool so prefetching never blocks the UI.
+
+    With a ``display_target``, the worker also runs ``prepare_display`` (encoding the image for the terminal at the
+    size it will be shown), so showing a prefetched photo costs the UI thread almost nothing.
+    """
 
     DEFAULT_CAPACITY = 48
     DEFAULT_WORKER_COUNT = 3
@@ -213,29 +269,32 @@ class PreviewCache:
         *,
         capacity: int = DEFAULT_CAPACITY,
         worker_count: int = DEFAULT_WORKER_COUNT,
+        prepare_display: Callable[[Image.Image, DisplayTarget], None] | None = None,
     ) -> None:
         self._capacity = capacity
+        self._prepare_display = prepare_display
         self._executor = ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="preview")
-        self._futures: OrderedDict[tuple[Path, int], Future[Preview]] = OrderedDict()
+        self._futures: OrderedDict[tuple[Path, int, DisplayTarget | None], Future[Preview]] = OrderedDict()
 
     def __repr__(self) -> str:
         return f"PreviewCache(entries={len(self._futures)}, capacity={self._capacity})"
 
-    def request(self, path: Path, *, max_edge_px: int) -> Future[Preview]:
+    def request(self, path: Path, *, max_edge_px: int, display_target: DisplayTarget | None = None) -> Future[Preview]:
         """Return a future for the preview, scheduling the decode if not yet cached."""
-        key = (path, max_edge_px)
+        key = (path, max_edge_px, display_target)
         future = self._futures.get(key)
         if future is not None and not future.cancelled():
             self._futures.move_to_end(key)
             return future
-        future = self._executor.submit(load_preview, path, max_edge_px=max_edge_px)
+        future = self._executor.submit(self._load, path, max_edge_px=max_edge_px, display_target=display_target)
         self._futures[key] = future
         self._evict_oldest()
         return future
 
-    async def get(self, path: Path, *, max_edge_px: int) -> Preview:
+    async def get(self, path: Path, *, max_edge_px: int, display_target: DisplayTarget | None = None) -> Preview:
         # Shield: cancelling the awaiting UI worker must not cancel the cached decode.
-        return await asyncio.shield(asyncio.wrap_future(self.request(path, max_edge_px=max_edge_px)))
+        future = self.request(path, max_edge_px=max_edge_px, display_target=display_target)
+        return await asyncio.shield(asyncio.wrap_future(future))
 
     def shutdown(self) -> None:
         self._executor.shutdown(wait=False, cancel_futures=True)
@@ -244,3 +303,10 @@ class PreviewCache:
         while len(self._futures) > self._capacity:
             _, evicted_future = self._futures.popitem(last=False)
             evicted_future.cancel()
+
+    def _load(self, path: Path, *, max_edge_px: int, display_target: DisplayTarget | None) -> Preview:
+        """Worker thread."""
+        preview = load_preview(path, max_edge_px=max_edge_px)
+        if preview.image is not None and display_target is not None and self._prepare_display is not None:
+            self._prepare_display(preview.image, display_target)
+        return preview
